@@ -178,18 +178,11 @@ D405 发送端的 JAKA 主机地址，不能是 JAKA 控制器 `192.168.71.36/37
 本轮修复将握持期间的 Trigger 合并为最新值，松开 Grip 且跟踪新鲜时才执行夹爪同步通信；
 执行前显式退出伺服，完成后恢复零增量保持。不要依赖握持运动期间夹爪立即动作。
 
-`xrt_teleop_bridge` 每 5 秒打印一次当前输入，并记录这段时间内所有新源帧的输入范围，例如：
+`xrt_teleop_bridge` 每 5 秒打印一次原始输入，例如：
 
 ```text
-Quest input: left tracked=True grip=0.000(valid=True) trigger=0.000(valid=True) | right tracked=True grip=0.000(valid=True) trigger=0.000(valid=True) | ... input_window_s=5.000 LG=[0.000,0.950](valid=410 invalid=0) RG=[0.000,0.000](valid=410 invalid=0) LT=[0.000,0.800](valid=410 invalid=0) RT=[0.000,0.000](valid=410 invalid=0)
+Quest input: left tracked=True grip=0.000 trigger=0.000 | right tracked=True grip=0.000 trigger=0.000
 ```
-
-`grip` / `trigger` 是打印时刻的瞬时值；两次日志之间按下后松开，瞬时值仍可全部为 0。
-`LG/RG/LT/RT` 分别是左/右 Grip、左/右 Trigger 在该日志区间的有效读数最小/最大值。
-上例实际读到了左 Grip=0.950、左 Trigger=0.800。`valid/invalid` 是新源帧样本数，`valid` 要求对应位姿与读数均有效；
-缓存 Joy 的重复发布不计数；`none` 表示该区间没有有效读数。`valid=True` 仅表示数值读取成功且
-位于 [0,1]，不能据此证明上游控制器按键状态正确，或机械臂已经接合。
-启动时还会显示实际加载的 bridge、SDK 和 Python 路径，以便发现运行了旧安装目录。
 
 按住右手 Grip 后应变成接近 `1.000`，并在对应 `rc_ctrl` 终端依次看到：
 
@@ -829,43 +822,6 @@ cd "$HOME/Documents/dj_main/XRToolKit/demo"
 未跟踪时输出 `untracked`；抓住手柄时应看到姿态数值持续变化，握住 Grip 时对应
 `grip` 接近 `1.000`，按 Trigger 时 `trigger` 接近 `1.000`。按 `Ctrl-C` 结束，再
 重新启动 `run_teleop.zsh`。
-
-### 输入专项自检（不执行机械臂/夹爪控制）
-
-**1. 无硬件离线自检**：新增脚本只使用 Python 标准库、假 SDK 和假 ROS 消息，
-无需安装 ROS、XRoboToolkit SDK 或 C++ 编译器。可在任意目录运行，生成的字节码仍位于
-`demo/build/offline/`。在 demo 目录执行：
-
-```zsh
-cd "$HOME/Documents/dj_main/XRToolKit/demo"
-python3 test/check_quest_input_offline.py
-```
-
-脚本验证原参考 getter 的非零数值和真实零原样进入 Joy、Pose/Joy 同 stamp、短按峰值、
-异常/NaN/越界、源超期、恢复屏障和诊断脚本；全部通过时显示 `PASS`，退出码为 0。
-这是软件回放测试，不代表现场 Quest/PC-service 接收已通过。完整控制链路离线测试仍使用
-`python3 test/run_offline_tests.py`。
-
-**2. 查看原始 SDK 输入**：停止 `run_teleop.zsh` 后执行增强的现有诊断脚本；
-它只初始化 XR 输入 SDK，不启动 ROS、JAKA 或夹爪。PC-service、Quest APK 的 Tracking/Send
-需保持开启。下面以 20ms 间隔采样 15 秒，分别持续按住左右 Grip 和 Trigger 约 2 秒：
-
-```zsh
-cd "$HOME/Documents/dj_main/XRToolKit/demo"
-mkdir -p log
-./diagnose_xrt.zsh --duration 15 --interval 0.02 | tee log/quest_input_probe.txt
-```
-
-输出先列出 Python 与 SDK 的实际加载路径，再逐次列出原始 getter 数值及 `valid`。
-`grip=0.000(valid=True raw=0.0)` 是 SDK 确实返回零；`invalid(valid=False ...)`
-会显示原值/异常原因，不再把 NaN 或读取错误显示为有效零。某一侧读取失败不影响另一侧输出。
-它与原参考代码使用同名 `get_left/right_grip`、`get_left/right_trigger` 接口；
-未加入阈值归零、手势替代、按键推断或额外 SDK 初始化。
-
-若持续按住时原始 SDK 仍返回零，现有截图不足以定位具体的头显/PC-service/SDK 原因，
-应保留上述文件及原参考程序在同一环境中的结果继续核对。若原始值有变化，再核对 bridge
-日志区间范围和 `/rc_ctrl/button` 的 axes[0:4]；若它们有变化但机械臂不动，继续检查
-对应 `rc_ctrl` 状态与故障日志。完成原始输入检查后再恢复 `run_teleop.zsh`。
 
 遥操作启动后，用另一个终端检查 ROS 话题：
 
