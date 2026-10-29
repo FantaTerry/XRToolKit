@@ -130,6 +130,7 @@ class XrtTeleopBridge(Node):
         self._last_valid_grip = {"left": 0.0, "right": 0.0}
         self._last_warning_time = 0.0
         self._last_input_log_time = 0.0
+        self._input_log_window = {}
         self._xrt = None
         self._sdk_initialized = False
         self._source = SourceFreshness(
@@ -156,6 +157,11 @@ class XrtTeleopBridge(Node):
             "uses valid-pose sentinel (no per-controller tracking flag in the "
             "reviewed Python API). SDK getters do not provide an atomic snapshot."
             % (self._has_source_timestamp, self.source_timeout_s)
+        )
+
+        self.get_logger().info(
+            "Input reader: bridge=%s SDK=%s Python=%s"
+            % (__file__, getattr(self._xrt, "__file__", "unknown"), sys.executable)
         )
 
         self.timer = self.create_timer(1.0 / self.publish_rate, self._publish)
@@ -326,6 +332,30 @@ class XrtTeleopBridge(Node):
             self.get_logger().info("%s controller tracking acquired" % side)
         self._pose_was_valid[side] = True
 
+    def _observe_input_log_window(self, side, state):
+        # Diagnostic only: count actual getter reads, never repeated cached Joy.
+        # A five-second instantaneous log otherwise hides a press then release.
+        if self.input_log_period <= 0.0:
+            return
+        for control, suffix in (("grip", "G"), ("trigger", "T")):
+            key = side[0].upper() + suffix
+            sample = self._input_log_window.setdefault(key, [None, None, 0, 0])
+            if state[control + "_valid"] and state["pose_valid"]:
+                value = state[control]
+                sample[0] = value if sample[0] is None else min(sample[0], value)
+                sample[1] = value if sample[1] is None else max(sample[1], value)
+                sample[2] += 1
+            else:
+                sample[3] += 1
+
+    def _input_log_window_text(self):
+        parts = []
+        for key in ("LG", "RG", "LT", "RT"):
+            low, high, valid, invalid = self._input_log_window.get(key, (None, None, 0, 0))
+            extent = "none" if low is None else "[%.3f,%.3f]" % (low, high)
+            parts.append("%s=%s(valid=%d invalid=%d)" % (key, extent, valid, invalid))
+        return " ".join(parts)
+
     def _publish(self):
         now = time.monotonic()
         self._poll_count += 1
@@ -340,6 +370,8 @@ class XrtTeleopBridge(Node):
             self._source_count += 1
             for side, enabled in (("left", self.enable_left), ("right", self.enable_right)):
                 self._cached_states[side] = self._controller_state(side) if enabled else {}
+                if enabled:
+                    self._observe_input_log_window(side, self._cached_states[side])
         states = {}
         for side, enabled in (("left", self.enable_left), ("right", self.enable_right)):
             state = dict(self._cached_states[side]) if enabled else {}
@@ -403,7 +435,8 @@ class XrtTeleopBridge(Node):
                 "Quest input: left tracked=%s grip=%.3f(valid=%s) trigger=%.3f(valid=%s) | "
                 "right tracked=%s grip=%.3f(valid=%s) trigger=%.3f(valid=%s) | source_ns=%s "
                 "receipt_mono_s=%s age_s=%.3f status=%s "
-                "poll_hz=%.1f source_hz=%.1f pose_hz=(%.1f,%.1f)"
+                "poll_hz=%.1f source_hz=%.1f pose_hz=(%.1f,%.1f) | "
+                "input_window_s=%.3f %s"
                 % (
                     left.get("pose_valid", False),
                     left.get("grip", 0.0),
@@ -423,8 +456,11 @@ class XrtTeleopBridge(Node):
                     self._source_count / elapsed,
                     self._pose_counts["left"] / elapsed,
                     self._pose_counts["right"] / elapsed,
+                    elapsed,
+                    self._input_log_window_text(),
                 )
             )
+            self._input_log_window.clear()
             self._last_input_log_time = now
             self._rate_started_s = now
             self._poll_count = self._source_count = 0

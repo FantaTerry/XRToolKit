@@ -163,6 +163,54 @@ class BridgeFreshnessTest(unittest.TestCase):
         self.assertTrue(node.tracking_publishers["left"].messages[-1].data)
         self.assertEqual(node.button_publisher.messages[-1].axes[0:4], [0.9, 0.9, 0.7, 0.7])
 
+    def test_short_press_between_periodic_logs_is_not_reported_as_always_zero(self):
+        node, sdk = self.make_bridge(input_log_period=5.0)
+        values = [0.0, 0.0, 0.0, 0.0]
+        for index, getter in enumerate(("get_left_grip", "get_right_grip",
+                                        "get_left_trigger", "get_right_trigger")):
+            setattr(sdk, getter, lambda index=index: values[index])
+        for now, sample in ((0.0, [0.0] * 4), (1.0, [0.91, 0.82, 0.73, 0.64]),
+                            (1.008, [0.0] * 4), (5.0, [0.0] * 4)):
+            values[:] = sample
+            sdk.timestamp += 1
+            self.tick(node, now)
+            joy = node.button_publisher.messages[-1]
+            # The reference SDK values must reach the legacy axes unmodified,
+            # independently of whether this tick prints a periodic log.
+            self.assertEqual(joy.axes[:4], sample)
+            self.assertEqual(joy.buttons[12:16], [1, 1, 1, 1])
+            self.assertEqual(joy.header.stamp, node.left_publisher.messages[-1].header.stamp)
+            self.assertEqual(joy.header.stamp, node.right_publisher.messages[-1].header.stamp)
+        logs = [line for line in node.logs if line.startswith("Quest input:")]
+        self.assertEqual(len(logs), 1)
+        self.assertIn("grip=0.000(valid=True)", logs[0])  # released at log time
+        for text in ("LG=[0.000,0.910](valid=4 invalid=0)",
+                     "RG=[0.000,0.820](valid=4 invalid=0)",
+                     "LT=[0.000,0.730](valid=4 invalid=0)",
+                     "RT=[0.000,0.640](valid=4 invalid=0)"):
+            self.assertIn(text, logs[0])  # short press remains visible
+        sdk.timestamp += 1
+        self.tick(node, 10.0)
+        self.assertIn("LG=[0.000,0.000](valid=1 invalid=0)", node.logs[-1])
+
+    def test_input_log_window_separates_invalid_reads_and_does_not_count_cached_joy(self):
+        node, sdk = self.make_bridge(input_log_period=1.0)
+        self.tick(node, 0.0)
+        sdk.get_left_grip = self.failing_getter
+        sdk.timestamp += 1
+        self.tick(node, 0.01)
+        self.tick(node, 0.02)  # repeated cached SDK sample is not a new read
+        sdk.get_left_grip = lambda: 0.0
+        sdk.timestamp += 1
+        self.tick(node, 1.0)
+        log = [line for line in node.logs if line.startswith("Quest input:")][-1]
+        self.assertIn("LG=[0.000,0.900](valid=2 invalid=1)", log)
+        self.assertIn("LT=[0.700,0.700](valid=3 invalid=0)", log)
+        # No new source data means no new valid read, even while Joy repeats.
+        self.tick(node, 2.0)
+        log = [line for line in node.logs if line.startswith("Quest input:")][-1]
+        self.assertIn("LG=none(valid=0 invalid=0)", log)
+
     def test_source_timeout_releases_grip_and_preserves_gripper(self):
         node, _sdk = self.make_bridge()
         self.tick(node, 0.0)
