@@ -44,8 +44,10 @@ def generate_launch_description():
         'gripper_trigger_deadband', default_value='0.02',
         description='Minimal change in analog trigger to send a new Grip()')
     gripper_initialize_arg = DeclareLaunchArgument(
-        'gripper_initialize', default_value='true',
+        'gripper_initialize', default_value='false',
         description='Initialize PGI grippers during node startup')
+    gripper_startup_open_arg = DeclareLaunchArgument('gripper_startup_open', default_value='false', description='Explicitly open on startup; false preserves held load')
+    gripper_motion_parameters_arg = DeclareLaunchArgument('gripper_configure_motion_parameters', default_value='false', description='Explicit startup force/speed writes')
     gripper_initialize_command_arg = DeclareLaunchArgument(
         'gripper_initialize_command', default_value='1',
         description='PGI initialization command: 1 or 165 (0xA5)')
@@ -137,6 +139,8 @@ def generate_launch_description():
             'gripper_linear': LaunchConfiguration('gripper_linear'),
             'gripper_trigger_deadband': LaunchConfiguration('gripper_trigger_deadband'),
             'gripper_initialize': LaunchConfiguration('gripper_initialize'),
+            'gripper_startup_open': LaunchConfiguration('gripper_startup_open'),
+            'gripper_configure_motion_parameters': LaunchConfiguration('gripper_configure_motion_parameters'),
             'gripper_initialize_command': LaunchConfiguration('gripper_initialize_command'),
             'gripper_initialize_delay_ms': LaunchConfiguration('gripper_initialize_delay_ms'),
             'gripper_configure_tio': LaunchConfiguration('gripper_configure_tio'),
@@ -171,6 +175,8 @@ def generate_launch_description():
         gripper_linear_arg,
         gripper_trigger_deadband_arg,
         gripper_initialize_arg,
+        gripper_startup_open_arg,
+        gripper_motion_parameters_arg,
         gripper_initialize_command_arg,
         gripper_initialize_delay_arg,
         gripper_configure_tio_arg,

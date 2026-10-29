@@ -123,6 +123,7 @@ void limits_and_transaction()
 {
   Config c;
   c.translation_deadband_mm = 0;
+  c.translation_filter_tau_s = 0;
   Harness h(c);
   h.tick();
   h.hand.tran = {250, 125, -70};
@@ -181,11 +182,11 @@ void release_and_reengage()
   h.sdk.actual.tran.x += 2; // feedback can differ from the submitted command
   h.grip = true;
   check(zero(h.tick().increment), "reengagement starts at fresh hand/actual feedback reference");
-  check(near(h.control.submitted().tran.x, held.tran.x + 2), "feedback is used only to establish new reference");
+  check(near(h.control.submitted().tran.x, held.tran.x), "later differing feedback cannot erase the accepted command epoch");
   h.hand.tran.x += 5;
   h.repeat(150);
-  check(near(h.control.submitted().tran.x, held.tran.x + 7, 0.001), "new clutch follows only new displacement");
-  std::cout << "PASS residual release and feedback-based reengagement\n";
+  check(near(h.control.submitted().tran.x, held.tran.x + 4.5, 0.001), "new clutch follows new displacement with fixed soft-deadzone bias");
+  std::cout << "PASS residual release and continuous command-epoch reengagement\n";
 }
 
 void stale_input_tracking_and_delays()
@@ -315,25 +316,14 @@ void rotation_regression()
   check(rotation_error(edge.control.target().rpy, edge.control.submitted().rpy) < 1e-6,
     "Euler wrap boundary remains a short relative rotation");
 
-  // Reproduce an independent limitation without silently redefining the
-  // existing controller-relative, shortest-arc scaling semantics. Crossing pi
-  // relative to the clutch origin is different from the small Euler wrap above.
-  constexpr double pi = 3.14159265358979323846;
+  // A half-turn sample is outside the enforced relative hand workspace.
+  // Both signs must hold rather than reinterpreting it on the opposite arc.
   Harness half_turn;
-  half_turn.tick(); // identity hand orientation is the clutch origin
-  half_turn.hand.quat = quat_from_rpy({0, 0, 179*pi/180});
   half_turn.tick();
-  const double before_crossing = half_turn.control.target().rpy.rz;
-  half_turn.hand.quat = quat_from_rpy({0, 0, 181*pi/180});
-  const Decision after = half_turn.tick();
-  const double after_crossing = half_turn.control.target().rpy.rz;
-  check(near(before_crossing, 89.5*pi/180, 1e-8) &&
-    near(after_crossing, -89.5*pi/180, 1e-8),
-    "known shortest-arc scaling limitation: +179/+181 maps to +89.5/-89.5 degrees");
-  check(vector_norm(rotation_vector(quat_from_rpy(after.increment.rpy))) <=
-    half_turn.config.rotation_max_step_rad + 1e-8,
-    "known target discontinuity does not bypass emitted angular step bound");
-  std::cout << "KNOWN LIMITATION: relative hand yaw +179/+181 deg maps to target +89.5/-89.5 deg at scale=0.5; emitted step remains bounded.\n";
+  half_turn.hand.quat = quat_from_rpy({0,0,3.12413936106985});
+  const Decision refused = half_turn.tick();
+  check(half_turn.control.state()==State::AwaitRelease && zero(refused.increment),
+    "relative near-pi orientation is refused before shortest-arc scaling");
   std::cout << "PASS quaternion signs, nonzero origins, rotation sign, independent noise and angular limits\n";
 }
 
@@ -387,6 +377,7 @@ void malformed_input_and_period()
   check(invalid.control.state() == State::AwaitRelease, "invalid translation inhibits tracking");
   Config c;
   c.period_s = 0.016;
+  c.translation_filter_tau_s = 0;
   c.max_interval_s = 0.064;
   Harness h(c);
   h.tick();
@@ -410,10 +401,246 @@ void malformed_input_and_period()
   check(startup.control.state() == State::Tracking, "startup release/fresh press engages");
   std::cout << "PASS invalid input, configuration and 16ms timebase\n";
 }
+
+void cached_feedback_reengagement()
+{
+  Config c;
+  c.arm_is_right = true;
+  Harness h(c);
+  h.sdk.actual.tran.y = 100;
+  h.tick(); // one feedback sample, next arrives about 100 ms later
+  h.hand.tran.y = 20;
+  for (int i=0;i<10;++i) {h.tick(true,false);}
+  const double before=h.control.submitted().tran.y;
+  check(near(before,101.76,1e-6), "repro reaches 101.76 mm before second feedback sample");
+  h.grip=false; h.tick(true,false);
+  h.grip=true; h.tick(true,false);
+  std::cout << "REENGAGE submitted before=" << before << " after=" << h.control.submitted().tran.y
+    << " executed=" << h.sdk.actual.tran.y << '\n';
+  check(near(h.control.submitted().tran.y,before), "reengagement cannot reset accepted INCR history to cached feedback");
+  h.hand.tran.y += 20;
+  for (int i=0;i<300;++i) {
+    // A 13-cycle SDK query interval is 104 ms; its cache is additionally
+    // delayed by 80 ms of execution. Queries are not synchronization barriers.
+    if (i%13==0) {
+      CartesianPose stale=h.sdk.actual; stale.tran.y=std::max(100.,stale.tran.y-2.);
+      h.control.set_feedback(stale,h.now);
+    }
+    h.tick(true,false);
+    check(h.sdk.actual.tran.y<=110.+1e-7, "physical sum of accepted INCRs never crosses Y=110 under delayed feedback");
+    check(near(h.sdk.actual.tran.y,h.control.submitted().tran.y), "command epoch and cumulative accepted increments remain aligned");
+  }
+
+  TeleopControl delayed(c);
+  ControllerPose hand;
+  CartesianPose executed{}; executed.tran.y=100;
+  double now=200,accepted_y=100;
+  bool held=true;
+  std::vector<std::pair<int,CartesianPose>> queue;
+  for(int cycle=0;cycle<450;++cycle) {
+    // Execution occurs 80ms after successful SDK acceptance. Robot feedback
+    // updates every104ms. Release/repress twice between feedback updates.
+    for(const auto &pending:queue) if(pending.first==cycle) executed.tran.y+=pending.second.tran.y;
+    if(cycle%13==0) delayed.set_feedback(executed,now);
+    if(cycle==1 || cycle==12 || cycle==25) hand.tran.y+=20;
+    held=cycle!=8 && cycle!=21;
+    delayed.set_pose(hand,now);delayed.set_grip(held,now);
+    const Decision d=delayed.plan(now);
+    check(d.send,"delayed model still generates exactly one command per period");
+    delayed.commit(0,now);
+    accepted_y+=d.increment.tran.y;
+    queue.push_back({cycle+10,d.increment});
+    check(near(accepted_y,delayed.submitted().tran.y),"lagging execution cannot overwrite accepted command history");
+    check(accepted_y<=110.+1e-7 && executed.tran.y<=110.+1e-7,"Y bound applies to both accepted and delayed-executed trajectories");
+    now+=c.period_s;
+  }
+  check(near(executed.tran.y,110,.001),"delayed queued execution settles at the real Y boundary");
+  std::cout << "PASS cached 100ms feedback and 80ms delayed execution cannot roll back clutch reference\n";
+}
+
+void continuous_slow_translation()
+{
+  Harness h;
+  h.tick();
+  double minimum=1e9, maximum=-1e9, sum=0, square=0;
+  int count=0;
+  for(int i=1;i<=750;++i) {
+    h.hand.tran.x=5.*i*h.config.period_s;
+    const Decision d=h.tick();
+    const double v=d.increment.tran.x/h.config.period_s;
+    if(i>=125) {minimum=std::min(minimum,v);maximum=std::max(maximum,v);sum+=v;square+=v*v;++count;}
+  }
+  const double mean=sum/count;
+  const double rms=std::sqrt(std::max(0.,square/count-mean*mean));
+  std::cout << "SLOW 5mm/s after1s min=" << minimum << " max=" << maximum
+    << " mean=" << mean << " ripple_rms=" << rms << " mm/s\n";
+  check(minimum>4.9 && maximum<5.1 && rms<.05, "5mm/s tracking must not repeatedly stall and jump at deadband threshold");
+  h.repeat(300);
+  check(zero(h.sdk.commands.back()), "constant accepted hand position settles to new-zero hold");
+  const double centre=h.control.submitted().tran.x;
+  double peak_noise=0,first_mean=0,last_mean=0;
+  for(int i=0;i<5000;++i) {
+    h.hand.tran.x=30.+(i%2 ? .2 : -.2);h.tick();
+    peak_noise=std::max(peak_noise,std::abs(h.control.submitted().tran.x-centre));
+    if(i>=1000 && i<2000) first_mean+=h.control.submitted().tran.x/1000.;
+    if(i>=4000) last_mean+=h.control.submitted().tran.x/1000.;
+  }
+  std::cout << "STATIC away-origin +/-0.2mm noise peak=" << peak_noise
+    << " block_mean_difference=" << last_mean-first_mean << " mm\n";
+  check(peak_noise<.1,
+    "away-origin static noise remains absolutely bounded and cannot accumulate a random walk");
+  h.hand.tran.x=30.;h.repeat(500);
+  check(std::abs(h.control.submitted().tran.x-centre)<.001,
+    "stationary away-origin noise leaves no permanent command offset when noise returns to centre");
+  std::cout << "STATIC returned-to-centre error=" << h.control.submitted().tran.x-centre << " mm\n";
+  for(int i=749;i>=0;--i) {h.hand.tran.x=5.*i*h.config.period_s;h.tick();}
+  h.repeat(500);
+  check(std::abs(h.control.submitted().tran.x)<.001, "slow out-and-back has less than 0.001mm final command error");
+  h.hand.tran.x=500;h.repeat(4);h.grip=false;
+  check(zero(h.tick().increment), "slow-motion filter cannot retain a release residual");
+  const double held=h.control.submitted().tran.x;h.repeat(500);
+  check(near(held,h.control.submitted().tran.x), "release clears the slow-motion trajectory residual");
+  Harness noise;
+  noise.tick();
+  for(int i=0;i<5000;++i) {noise.hand.tran.x=(i%2 ? .2 : -.2);noise.tick();}
+  check(near(noise.control.submitted().tran.x,0), "bounded stationary input noise has no cumulative drift");
+  std::cout << "PASS continuous slow speed, static noise, roundtrip and residual release\n";
+}
+
+void rotation_workspace_reengagement()
+{
+  constexpr double pi=3.14159265358979323846;
+  for(int sign:{1,-1}) {
+    Harness h;
+    h.sdk.actual.rpy={.5,-.6,.9};
+    h.hand.quat=quat_from_rpy({.4,.2,-.7});
+    h.tick();
+    const Quaternion origin=h.hand.quat;
+    for(double degrees:{120.,160.,169.,179.,181.,179.,160.}) {
+      h.hand.quat=quat_multiply(quat_from_rpy({0,0,sign*degrees*pi/180}),origin);
+      h.hand.quat={-h.hand.quat.s,-h.hand.quat.x,-h.hand.quat.y,-h.hand.quat.z};
+      const Decision d=h.tick();
+      if(degrees>=179 || h.control.state()==State::AwaitRelease) {
+        check(h.control.state()==State::AwaitRelease && zero(d.increment),
+          "crossing relative attitude workspace must hold instead of pursuing opposite shortest-arc target");
+      }
+    }
+    check(h.control.state()==State::AwaitRelease,"return from boundary while held cannot silently resume");
+    h.grip=false;h.tick();h.grip=true;
+    check(zero(h.tick().increment),"workspace re-clutch uses current hand orientation without old residual");
+    h.hand.quat=quat_multiply(quat_from_rpy({0,.04,0}),h.hand.quat);
+    check(h.tick().send && h.control.state()==State::Tracking,"new small rotation works after release/repress");
+  }
+
+  Harness dropped;
+  dropped.tick();
+  dropped.hand.quat=quat_from_rpy({0,0,169*pi/180});dropped.tick();
+  dropped.hand.quat=quat_from_rpy({0,0,191*pi/180});
+  check(zero(dropped.tick().increment) && dropped.control.state()==State::AwaitRelease,
+    "dropped-frame path across pi cannot bypass the workspace with two inside endpoints");
+
+  TeleopControl queued;
+  ControllerPose frame;
+  queued.set_feedback({},300.);
+  check(queued.set_ordered_input(frame,true,300.,300.,300.2,1),"queued workspace fixture starts with a complete frame");
+  check(queued.plan(300.).send,"queued workspace fixture sends initial hold");queued.commit(0,300.);
+  frame.quat=quat_from_rpy({0,0,179*pi/180});
+  queued.set_ordered_input(frame,true,300.004,300.004,300.2,2);
+  frame.quat=quat_from_rpy({0,0,160*pi/180});
+  queued.set_ordered_input(frame,true,300.006,300.006,300.2,3);
+  const Decision after_multiple=queued.plan(300.008);
+  check(after_multiple.send && zero(after_multiple.increment) && queued.state()==State::AwaitRelease,
+    "an intermediate complete frame outside workspace cannot be overwritten by an inside frame before one plan");
+  std::cout << "PASS enforced relative rotation workspace, q/-q, nonzero origins, path crossing and re-clutch\n";
+}
+
+
+void source_deadline_at_execution()
+{
+  Harness h;
+  h.now=100.144;
+  h.tick();
+  // Source frame produced at100.0 reaches host at100.150: receive-age budget
+  // remains200ms, but its source budget expires at100.200, only50ms later.
+  h.hand.tran.x=20.;
+  h.control.set_pose(h.hand,100.150);
+  h.control.set_grip(true,100.150);
+  h.control.set_input_deadline(100.200);
+  for(double t:{100.152,100.160,100.168,100.176,100.184,100.192,100.200}) {
+    h.now=t;const Decision d=h.tick(false);
+    check(d.send && h.control.state()==State::Tracking,
+      "source remains executable through its exact monotonic deadline");
+  }
+  h.now=100.208;
+  const Decision expired=h.tick(false);
+  check(expired.send && zero(expired.increment) && h.control.state()==State::AwaitRelease,
+    "source deadline stops motion even though receipt age remains below input_timeout");
+  h.grip=false;h.tick();h.grip=true;
+  check(zero(h.tick().increment) && h.control.state()==State::AwaitRelease,
+    "expired source deadline also prevents clutch reengagement");
+  h.control.set_input_deadline(h.now+.1);
+  h.grip=false;h.tick();h.grip=true;h.tick();
+  check(h.control.state()==State::Tracking,"new source deadline plus actual release permits new reference");
+  std::cout << "PASS execution-time source deadline distinct from receive TTL\n";
+}
+
+
+void source_ordered_input_preserves_receive_age()
+{
+  Config config;
+  config.max_interval_s=1.;
+  TeleopControl c(config);
+  ControllerPose first,second;
+  second.tran.x=20.;
+  c.external_pause("requires_initial_release");
+  check(c.set_ordered_input(first,false,200.010,200.011,200.050,1),"first source-ordered release frame admitted");
+  check(c.set_ordered_input(second,true,200.005,200.006,200.050,2),"newer source frame can carry earlier original receipt times");
+  check(near(c.latest_input().tran.x,20.),"latest complete source frame replaces the pose despite reversed callback receipt order");
+  c.set_feedback({},200.020);
+  Decision d=c.plan(200.020);check(d.send && zero(d.increment),"ordered reengagement creates a zero-displacement origin");c.commit(0,200.020);
+  second.tran.x=30.;
+  check(c.set_ordered_input(second,true,200.014,200.015,200.050,3),"subsequent ordered motion frame admitted");
+  d=c.plan(200.028);check(d.send && d.increment.tran.x>0,"newer ordered pose drives motion");c.commit(0,200.028);
+  c.external_pause("requires_new_release");
+  check(!c.set_ordered_input(first,false,200.030,200.031,200.200,3),"replayed source sequence ignored even with fabricated newer receipt times");
+  check(c.state()==State::AwaitRelease,"replaying a release cannot acknowledge a new interruption");
+  check(c.set_ordered_input(second,false,200.016,200.017,200.050,4),"new source release acknowledges the pause");
+  check(c.set_ordered_input(second,true,200.012,200.013,200.050,5),"later source press retains its earlier raw receipt age");
+  d=c.plan(200.036);check(d.send && zero(d.increment),"reengagement rebases to newest ordered hand frame");c.commit(0,200.036);
+  second.tran.x=50.;
+  check(c.set_ordered_input(second,true,200.012,200.013,200.050,6),"source ordering does not grant a new receive lifetime");
+  d=c.plan(200.044);check(d.send && d.increment.tran.x>0,"source before original deadline remains executable");c.commit(0,200.044);
+  d=c.plan(200.052);check(d.send && zero(d.increment) && c.state()==State::AwaitRelease,"original source deadline expires regardless of ordered assembly time");c.commit(0,200.052);
+  first.tran.x=std::numeric_limits<double>::quiet_NaN();
+  check(!c.set_ordered_input(first,false,200.060,200.061,200.150,7) && c.state()==State::AwaitRelease,"malformed ordered release cannot acknowledge interruption");
+  check(!c.set_ordered_input(second,false,200.062,200.063,200.150,6),"older sequence cannot replace an invalid newer frame");
+
+  TeleopControl receive_ttl(config);
+  receive_ttl.set_feedback({},200.020);
+  check(receive_ttl.set_ordered_input(second,true,200.005,200.006,200.500,1),"long source lifetime does not replace raw receive TTL");
+  d=receive_ttl.plan(200.020);receive_ttl.commit(0,200.020);
+  second.tran.x+=20.;
+  check(receive_ttl.set_ordered_input(second,true,200.007,200.008,200.500,2),"new ordered sample preserves early raw receive times");
+  d=receive_ttl.plan(200.028);receive_ttl.commit(0,200.028);
+  receive_ttl.set_feedback({},200.208);
+  d=receive_ttl.plan(200.208);
+  check(d.send && zero(d.increment) && receive_ttl.state()==State::AwaitRelease,"receive TTL expires from callback arrival, not assembly/processing time");
+  std::cout << "PASS source-ordered input with reversed receipt order, replay rejection and original age budgets\n";
+}
+
 }  // namespace
 
-int main()
+int main(int argc, char **argv)
 {
+  if(argc>1) {
+    const std::string name=argv[1];
+    if(name=="cached_feedback") cached_feedback_reengagement();
+    else if(name=="slow_translation") continuous_slow_translation();
+    else if(name=="rotation_workspace") rotation_workspace_reengagement();
+    else if(name=="ordered_input") source_ordered_input_preserves_receive_age();
+    else return 2;
+    return 0;
+  }
   continuous_hold_and_unique_decision();
   no_increment_replay_and_return_sequence();
   limits_and_transaction();
@@ -423,5 +650,10 @@ int main()
   rotation_regression();
   y_boundary_and_failure();
   malformed_input_and_period();
-  std::cout << "All 9 offline teleop control scenario groups passed.\n";
+  cached_feedback_reengagement();
+  continuous_slow_translation();
+  rotation_workspace_reengagement();
+  source_deadline_at_execution();
+  source_ordered_input_preserves_receive_age();
+  std::cout << "All 14 offline teleop control scenario groups passed.\n";
 }

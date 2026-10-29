@@ -9,7 +9,7 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import Joy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int64
 
 from xrt_teleop.xrt_adapter import (
     DEFAULT_HEADSET_TO_ROBOT,
@@ -65,6 +65,12 @@ class XrtTeleopBridge(Node):
         self.right_tracking_topic = str(self.declare_parameter(
             "right_tracking_topic", "/rc_ctrl/right_tracking"
         ).value)
+        self.left_input_state_topic = str(self.declare_parameter(
+            "left_input_state_topic", "/rc_ctrl/left_input_state"
+        ).value)
+        self.right_input_state_topic = str(self.declare_parameter(
+            "right_input_state_topic", "/rc_ctrl/right_input_state"
+        ).value)
         self.enable_left = bool(
             self.declare_parameter("enable_left", True).value
         )
@@ -111,10 +117,17 @@ class XrtTeleopBridge(Node):
             "left": self.create_publisher(Bool, self.left_tracking_topic, qos),
             "right": self.create_publisher(Bool, self.right_tracking_topic, qos),
         }
+        self.input_state_publishers = {
+            "left": self.create_publisher(Int64, self.left_input_state_topic, qos),
+            "right": self.create_publisher(Int64, self.right_input_state_topic, qos),
+        }
 
         self._filtered = {"left": None, "right": None}
         self._pose_was_valid = {"left": False, "right": False}
+        self._input_state_value = {"left": 0, "right": 0}
+        self._input_was_valid = {"left": False, "right": False}
         self._last_valid_trigger = {"left": 0.0, "right": 0.0}
+        self._last_valid_grip = {"left": 0.0, "right": 0.0}
         self._last_warning_time = 0.0
         self._last_input_log_time = 0.0
         self._xrt = None
@@ -195,29 +208,38 @@ class XrtTeleopBridge(Node):
         except Exception:
             return default
 
-    @staticmethod
-    def _finite_float(value, default):
+    def _read_analog(self, getter_name, previous):
+        """Return a numeric sample and independent getter validity.
+
+        Invalid values must not become a successful zero-valued release or a
+        saturated Trigger command. Retaining the previous numeric value is
+        diagnostic/legacy compatibility only; validity bits prohibit its use.
+        """
         try:
-            result = float(value)
-        except (TypeError, ValueError):
-            return default
-        return result if math.isfinite(result) else default
+            result = float(getattr(self._xrt, getter_name)())
+            valid = math.isfinite(result) and 0.0 <= result <= 1.0
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            valid = False
+        except Exception:
+            valid = False
+        return (result, True) if valid else (previous, False)
 
     def _controller_state(self, side):
         prefix = "left" if side == "left" else "right"
         pose = self._safe_value("get_%s_controller_pose" % prefix, ())
         pose_valid = raw_pose_is_valid(pose)
-        grip = self._finite_float(
-            self._safe_value("get_%s_grip" % prefix, 0.0), 0.0
+        grip, grip_valid = self._read_analog(
+            "get_%s_grip" % prefix, self._last_valid_grip[side]
         )
-        trigger = self._finite_float(
-            self._safe_value("get_%s_trigger" % prefix, None),
-            self._last_valid_trigger[side],
+        trigger, trigger_valid = self._read_analog(
+            "get_%s_trigger" % prefix, self._last_valid_trigger[side]
         )
         axis = self._safe_value("get_%s_axis" % prefix, (0.0, 0.0))
-        if pose_valid:
-            self._last_valid_trigger[side] = max(0.0, min(1.0, trigger))
-        else:
+        if pose_valid and grip_valid:
+            self._last_valid_grip[side] = grip
+        if pose_valid and trigger_valid:
+            self._last_valid_trigger[side] = trigger
+        if not pose_valid:
             # Tracking loss must release the arm without commanding the gripper
             # to change state. Keep the last trigger value in the Joy message.
             trigger = self._last_valid_trigger[side]
@@ -225,7 +247,9 @@ class XrtTeleopBridge(Node):
             "pose": pose,
             "pose_valid": pose_valid,
             "grip": grip if pose_valid else 0.0,
+            "grip_valid": grip_valid,
             "trigger": trigger,
+            "trigger_valid": trigger_valid,
             "axis": axis if pose_valid else (0.0, 0.0),
             "X": (
                 pose_valid
@@ -325,12 +349,27 @@ class XrtTeleopBridge(Node):
                 # Neutral Grip on disconnect; retain the last accepted trigger
                 # so loss of tracking does not open a closed gripper.
                 state.update(grip=0.0, trigger=self._last_valid_trigger[side],
+                             grip_valid=False, trigger_valid=False,
                              axis=(0.0, 0.0), X=False, Y=False, A=False, B=False,
                              menu=False, axis_click=False)
             states[side] = state
             tracking = Bool()
             tracking.data = state["pose_valid"]
             self.tracking_publishers[side].publish(tracking)
+            # This source-issued barrier is authoritative for recovery. Bool
+            # alone cannot fence complete pre-loss frames still in transit.
+            # Positive: first recovered frame's ROS stamp, fixed throughout
+            # this healthy generation. Negative: first observed loss ROS stamp.
+            # The value is repeated so a lost transition cannot remove fencing.
+            valid = state["pose_valid"]
+            if self._input_state_value[side] == 0 or valid != self._input_was_valid[side]:
+                stamp = self._source_stamp if valid else self.get_clock().now().to_msg()
+                stamp_ns = stamp.sec * 1000000000 + stamp.nanosec
+                self._input_state_value[side] = stamp_ns if valid else -stamp_ns
+                self._input_was_valid[side] = valid
+            input_state = Int64()
+            input_state.data = self._input_state_value[side]
+            self.input_state_publishers[side].publish(input_state)
         left, right = states["left"], states["right"]
 
         if self.enable_left:
@@ -361,17 +400,21 @@ class XrtTeleopBridge(Node):
                 if self._source.last_advance_s is not None else float("inf")
             )
             self.get_logger().info(
-                "Quest input: left tracked=%s grip=%.3f trigger=%.3f | "
-                "right tracked=%s grip=%.3f trigger=%.3f | source_ns=%s "
+                "Quest input: left tracked=%s grip=%.3f(valid=%s) trigger=%.3f(valid=%s) | "
+                "right tracked=%s grip=%.3f(valid=%s) trigger=%.3f(valid=%s) | source_ns=%s "
                 "receipt_mono_s=%s age_s=%.3f status=%s "
                 "poll_hz=%.1f source_hz=%.1f pose_hz=(%.1f,%.1f)"
                 % (
                     left.get("pose_valid", False),
                     left.get("grip", 0.0),
+                    left.get("grip_valid", False),
                     left.get("trigger", 0.0),
+                    left.get("trigger_valid", False),
                     right.get("pose_valid", False),
                     right.get("grip", 0.0),
+                    right.get("grip_valid", False),
                     right.get("trigger", 0.0),
+                    right.get("trigger_valid", False),
                     self._source.last_source_ns,
                     self._source.last_advance_s,
                     age,

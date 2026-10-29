@@ -64,10 +64,12 @@ def main():
     options = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Wpedantic",
                "-Werror", "-UNDEBUG", "-D_USE_MATH_DEFINES", "-I", DRIVER / "include"]
     extension = ".exe" if os.name == "nt" else ""
-    for name in ("orientation_math_test", "pgi140_protocol_test", "teleop_control_test"):
+    for name in ("orientation_math_test", "pgi140_protocol_test", "teleop_control_test", "teleop_input_test", "pgi140_gripper_startup_test"):
         sources = [DRIVER / "test" / (name + ".cpp")]
         if name == "pgi140_protocol_test":
             sources.append(DRIVER / "src" / "pgi140_protocol.cpp")
+        if name == "pgi140_gripper_startup_test":
+            sources.extend([DRIVER / "src" / "pgi140_gripper.cpp", DRIVER / "src" / "pgi140_protocol.cpp"])
         output = BUILD / (name + extension)
         run(options + sources + ["-o", output], env=env)
         run([output], env=env)
@@ -82,6 +84,12 @@ def main():
                    DRIVER / "src" / "pgi140_gripper.cpp",
                    DRIVER / "src" / "pgi140_protocol.cpp", "-o", node_test], env=env)
     run([node_test], env=env)
+    run([node_test, "source"], env=env)
+    run([node_test, "pairing"], env=env)
+    run([node_test, "validity"], env=env)
+    run([node_test, "gripper_deadline"], env=env)
+    run([node_test, "inflight_epoch"], env=env)
+    run([node_test, "trigger_cancel"], env=env)
     # The existing launch unit test checks the configured interpreter path but
     # does not execute it. Supply an explicitly inert fixture on non-ROS hosts.
     # This does not make a claim about a working project virtual environment.

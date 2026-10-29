@@ -14,9 +14,11 @@
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "sensor_msgs/msg/joy.hpp"
 #include "std_msgs/msg/bool.hpp"
+#include "std_msgs/msg/int64.hpp"
 #include "jaka_driver/JAKAZuRobot.h"
 #include "jaka_driver/pgi140_gripper.hpp"
 #include "jaka_driver/teleop_control.hpp"
+#include "jaka_driver/teleop_input.hpp"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -37,6 +39,7 @@ public:
     auto target = declare_parameter<std::string>("target_topic", "/rc_ctrl/" + arm_ + "_target");
     auto buttons = declare_parameter<std::string>("button_topic", "/rc_ctrl/button");
     auto tracking = declare_parameter<std::string>("tracking_topic", "/rc_ctrl/" + arm_ + "_tracking");
+    auto input_state = declare_parameter<std::string>("input_state_topic", "/rc_ctrl/" + arm_ + "_input_state");
     grip_axis_ = declare_parameter<int>("grip_axis", right ? 1 : 0);
     trigger_axis_ = declare_parameter<int>("gripper_axis", right ? 3 : 2);
     int button = declare_parameter<int>("gripper_button_index", -1);
@@ -58,6 +61,8 @@ public:
     cfg_.feedback_timeout_s = declare_parameter<double>("feedback_timeout_s", .3);
     cfg_.translation_speed_mm_s = declare_parameter<double>("translation_speed_mm_s", 125.);
     cfg_.translation_accel_mm_s2 = declare_parameter<double>("translation_accel_mm_s2", 500.);
+    cfg_.translation_filter_tau_s = declare_parameter<double>("translation_filter_tau_s", .04);
+    cfg_.rotation_workspace_rad = declare_parameter<double>("rotation_workspace_rad", 2.9670597283903604);
     cfg_.translation_deadband_mm = declare_parameter<double>("translation_deadband_mm", .5);
     cfg_.use_rotation = declare_parameter<bool>("use_rpy_ctrl", true);
     cfg_.rotation_speed_rad_s = declare_parameter<double>("rotation_speed_rad_s", .1875);
@@ -77,6 +82,8 @@ public:
     if (!std::isfinite(feedback_period_) || feedback_period_ <= 0 || feedback_period_ >= cfg_.feedback_timeout_s ||
         !std::isfinite(gripper_timeout_) || gripper_timeout_ <= 0 || !std::isfinite(source_age_) || source_age_ <= 0)
       throw std::invalid_argument("invalid freshness/SDK timing parameters");
+    input_ = std::make_unique<jaka_teleop::InputAssembler>(source_age_, cfg_.input_timeout_s,
+      require_tracking_,32,release_,trigger_deadband_);
     control_ = std::make_unique<jaka_teleop::TeleopControl>(cfg_);
     control_->external_pause("startup_requires_release");
     filter_ = declare_parameter<std::string>("servo_filter", "carte_nlf");
@@ -101,7 +108,9 @@ public:
     gc.speed_percent = declare_parameter<int>("gripper_speed", 100);
     gc.open_position = declare_parameter<int>("gripper_open_position", 1000);
     gc.closed_position = declare_parameter<int>("gripper_closed_position", 0);
-    gc.initialize = declare_parameter<bool>("gripper_initialize", true);
+    gc.initialize = declare_parameter<bool>("gripper_initialize", false);
+    gc.configure_motion_parameters = declare_parameter<bool>("gripper_configure_motion_parameters", false);
+    gc.startup_open = declare_parameter<bool>("gripper_startup_open", false);
     gc.initialize_command = declare_parameter<int>("gripper_initialize_command", 1);
     gc.initialize_delay_ms = declare_parameter<int>("gripper_initialize_delay_ms", 2000);
     gc.configure_tio = declare_parameter<bool>("gripper_configure_tio", false);
@@ -119,7 +128,8 @@ public:
       "planned_x,planned_y,planned_z,submitted_x,submitted_y,submitted_z,feedback_receive_s,"
       "feedback_x,feedback_y,feedback_z,j1_rad,j2_rad,j3_rad,j4_rad,j5_rad,j6_rad,"
       "hand_x,hand_y,hand_z,hand_qw,hand_qx,hand_qy,hand_qz,target_rx,target_ry,target_rz,"
-      "submitted_rx,submitted_ry,submitted_rz,feedback_rx,feedback_ry,feedback_rz,fault_code,fault_time_s,dropped_records\n";
+      "submitted_rx,submitted_ry,submitted_rz,feedback_rx,feedback_ry,feedback_rz,fault_code,fault_time_s,"
+      "input_deadline_s,frame_valid,release_valid,pair_dropped,source_stamp_ns,input_state_ns,state_accepted,dropped_records\n";
     pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(target, rclcpp::QoS(1),
       [this](geometry_msgs::msg::PoseStamped::SharedPtr m) { receive_pose(*m); });
     joy_sub_ = create_subscription<sensor_msgs::msg::Joy>(buttons, rclcpp::QoS(1),
@@ -127,8 +137,19 @@ public:
     tracking_sub_ = create_subscription<std_msgs::msg::Bool>(tracking, rclcpp::QoS(1),
       [this](std_msgs::msg::Bool::SharedPtr m) {
         std::lock_guard<std::mutex> lock(mail_mutex_);
-        mail_.tracked = m->data; mail_.tracking_receive = steady_seconds();
-        if (!m->data) { mail_.interrupted = true; mail_.pose_valid = false; }
+        // This legacy, unstamped heartbeat is diagnostic only. Cross-topic
+        // arrival order cannot establish which recovery epoch owns a frame.
+        mail_.tracking_diagnostic=m->data;
+      });
+    input_state_sub_ = create_subscription<std_msgs::msg::Int64>(input_state, rclcpp::QoS(1),
+      [this](std_msgs::msg::Int64::SharedPtr m) {
+        if(faulted_) return;
+        std::lock_guard<std::mutex> lock(mail_mutex_);
+        const double received=steady_seconds();
+        mail_.input_state_ns=m->data;
+        mail_.state_accepted=input_->tracking_state(m->data,received);
+        mail_.tracked=input_->tracking_valid();
+        if(mail_.state_accepted) mail_.tracking_receive=received;
       });
     log_timer_ = create_wall_timer(std::chrono::seconds(1), [this]() { flush_records(); });
     RCLCPP_INFO(get_logger(), "[%s] SDK owner step=%d period=%.3fs watchdog=%.3fs; Trigger deferred until Grip release",
@@ -142,7 +163,14 @@ private:
     jaka_teleop::ControllerPose pose;
     double pose_source = 0, pose_receive = -1, joy_source = 0, joy_receive = -1, tracking_receive = -1;
     bool tracked = false, grip = false, interrupted = false, pose_valid = false;
-    double trigger = 0;
+    double trigger = 0, deadline = -1;
+    bool release_valid = false;
+    bool tracking_diagnostic = false;
+    int64_t source_stamp_ns = 0;
+    int64_t input_state_ns = 0;
+    bool state_accepted = false;
+    size_t pair_dropped = 0;
+    std::vector<jaka_teleop::InputFrame> frames;
   } mail_;
   struct Record {
     std::string kind, reason;
@@ -155,44 +183,52 @@ private:
     CartesianPose target{}, planned{}, submitted{}, before{}, feedback{};
     JointValue joints{};
   };
-  bool valid_source(double stamp) {
-    const double age = now().seconds() - stamp;
-    return stamp > 0 && std::isfinite(age) && age >= -.05 && age <= source_age_;
+  template<class Stamp> static int64_t stamp_ns(const Stamp &s) {
+    return static_cast<int64_t>(s.sec)*1000000000LL+s.nanosec;
   }
   void receive_pose(const geometry_msgs::msg::PoseStamped &m) {
     if (faulted_) return;
     jaka_teleop::ControllerPose p;
-    p.tran = {m.pose.position.x*1000., m.pose.position.y*1000., m.pose.position.z*1000.};
-    Quaternion q{m.pose.orientation.w,m.pose.orientation.x,m.pose.orientation.y,m.pose.orientation.z};
-    double stamp = stamp_seconds(m.header.stamp);
+    p.tran={m.pose.position.x*1000.,m.pose.position.y*1000.,m.pose.position.z*1000.};
+    p.quat={m.pose.orientation.w,m.pose.orientation.x,m.pose.orientation.y,m.pose.orientation.z};
     std::lock_guard<std::mutex> lock(mail_mutex_);
-    if (stamp == mail_.pose_source) return; // cached frame is neither new nor an immediate fault
-    if (!valid_source(stamp) || stamp < mail_.pose_source || !std::isfinite(p.tran.x) ||
-        !std::isfinite(p.tran.y) || !std::isfinite(p.tran.z) || !jaka_teleop::quat_normalize(q,&p.quat)) {
-      mail_.interrupted = true; mail_.pose_valid = false; return;
-    }
-    mail_.pose = p; mail_.pose_source = stamp; mail_.pose_receive = steady_seconds(); mail_.pose_valid = true;
+    input_->pose(stamp_ns(m.header.stamp),p,now().seconds(),steady_seconds());
   }
   void receive_joy(const sensor_msgs::msg::Joy &m) {
     if (faulted_) return;
-    double stamp = stamp_seconds(m.header.stamp);
+    const size_t side=arm_=="right" ? 1 : 0;
+    bool gv=m.buttons.size()>=16 && m.buttons[12+side]==1;
+    bool tv=m.buttons.size()>=16 && m.buttons[14+side]==1;
+    double grip=0,trigger=0;
+    if(m.axes.size()>static_cast<size_t>(grip_axis_)) grip=m.axes[grip_axis_]; else gv=false;
+    if(linear_) {
+      if(m.axes.size()>static_cast<size_t>(trigger_axis_)) trigger=m.axes[trigger_axis_]; else tv=false;
+    } else {
+      if(m.buttons.size()>static_cast<size_t>(trigger_button_)) trigger=m.buttons[trigger_button_] ? 1. : 0.; else tv=false;
+    }
     std::lock_guard<std::mutex> lock(mail_mutex_);
-    if (stamp == mail_.joy_source) return;
-    if (!valid_source(stamp) || stamp < mail_.joy_source || m.axes.size() <= static_cast<size_t>(grip_axis_) ||
-        !std::isfinite(m.axes[grip_axis_])) { mail_.interrupted = true; return; }
-    bool grip = jaka_teleop::grip_state(mail_.grip,m.axes[grip_axis_],press_,release_);
-    if (mail_.grip && !grip) mail_.interrupted = true; // sticky across an SDK stall
-    mail_.grip = grip; mail_.joy_source = stamp; mail_.joy_receive = steady_seconds();
-    double trigger = 0;
-    if (linear_ && m.axes.size() > static_cast<size_t>(trigger_axis_)) trigger = m.axes[trigger_axis_];
-    else if (!linear_ && m.buttons.size() > static_cast<size_t>(trigger_button_)) trigger = m.buttons[trigger_button_] ? 1. : 0.;
-    if (std::isfinite(trigger)) mail_.trigger = std::clamp(trigger,0.,1.);
+    input_->joy(stamp_ns(m.header.stamp),grip,trigger,gv,tv,now().seconds(),steady_seconds());
   }
   Mailbox snapshot() {
     std::lock_guard<std::mutex> lock(mail_mutex_);
-    Mailbox copy = mail_; mail_.interrupted = false; return copy;
+    auto frames=input_->drain(steady_seconds());
+    for(auto &f:frames) {
+      f.pressed=jaka_teleop::grip_state(mail_.grip,f.grip_value,press_,release_);
+      mail_.grip=f.pressed; mail_.pose=f.pose;
+      mail_.pose_source=mail_.joy_source=f.stamp_ns*1e-9;
+      mail_.source_stamp_ns=f.stamp_ns;
+      mail_.pose_receive=f.pose_receive; mail_.joy_receive=f.joy_receive;
+      mail_.trigger=f.trigger; mail_.deadline=f.deadline;
+    }
+    mail_.pose_valid=input_->current_fresh(steady_seconds());
+    mail_.release_valid=input_->release_fresh(steady_seconds(),release_);
+    mail_.pair_dropped=input_->dropped();
+    Mailbox copy=mail_; copy.frames=std::move(frames);
+    copy.interrupted=input_->take_interruption();
+    return copy;
   }
   void record(Record r) {
+    r.input.frames.clear(); // consumed pairing events are not duplicated into CSV buffers
     r.state = static_cast<int>(control_->state()); r.reason = control_->reason();
     r.fault_code = control_->fault_code(); r.fault_time = control_->fault_time();
     r.target = control_->target(); r.planned = control_->planned(); r.submitted = control_->submitted();
@@ -224,7 +260,9 @@ private:
         << ',' << r.target.rpy.rx << ',' << r.target.rpy.ry << ',' << r.target.rpy.rz
         << ',' << r.submitted.rpy.rx << ',' << r.submitted.rpy.ry << ',' << r.submitted.rpy.rz
         << ',' << r.feedback.rpy.rx << ',' << r.feedback.rpy.ry << ',' << r.feedback.rpy.rz
-        << ',' << r.fault_code << ',' << r.fault_time << ',' << dropped << '\n';
+        << ',' << r.fault_code << ',' << r.fault_time << ',' << m.deadline << ',' << m.pose_valid
+        << ',' << m.release_valid << ',' << m.pair_dropped << ',' << m.source_stamp_ns
+        << ',' << m.input_state_ns << ',' << m.state_accepted << ',' << dropped << '\n';
     }
     csv_.flush();
   }
@@ -310,16 +348,30 @@ private:
     if (!check(robot_.servo_move_enable(false),"gripper_servo_exit")) return;
     servo_enabled_=false;
     auto fresh=snapshot();
-    if (!release_ready(fresh) || stopping()) {
+    apply_input(fresh); // every drained event is processed, including during maintenance
+    if (!release_ready(fresh) || !trigger_request_current(fresh) || stopping()) {
       if (!stopping() && check(robot_.servo_move_enable(true),"gripper_cancelled_servo_resume")) servo_enabled_=true;
       return;
     }
     Record r; r.kind="gripper"; r.input=fresh; r.start=steady_seconds(); std::string error;
+    bool cancelled=false;
+    gripper_->set_command_guard([&]() {
+      auto current=snapshot(); apply_input(current);
+      if(stopping() || !release_ready(current) ||
+          std::fabs(current.trigger-fresh.trigger)>=trigger_deadband_ ||
+          !trigger_request_current(fresh)) cancelled=true;
+      return !cancelled;
+    });
     bool ok=linear_ ? gripper_->Grip(static_cast<float>(fresh.trigger),&error) : gripper_->set_closed(fresh.trigger>.5,&error);
+    gripper_->set_command_guard({});
     r.end=steady_seconds(); r.ret=ok ? 0 : gripper_->last_sdk_return();
-    if (!ok || r.end-r.start > gripper_timeout_) {
-      control_->fault(ok ? kTimingFault : (r.ret ? r.ret : kGripperFault),r.end,ok ? "gripper_call_overrun" : "gripper_call_failed");
+    const bool overrun=r.end-r.start>gripper_timeout_;
+    if ((!ok && !cancelled) || overrun) {
+      control_->fault(overrun ? kTimingFault : (r.ret ? r.ret : kGripperFault),r.end,overrun ? "gripper_call_overrun" : "gripper_call_failed");
       RCLCPP_ERROR(get_logger(), "[%s] gripper duration=%.6fs detail=%s",arm_.c_str(),r.end-r.start,error.c_str());
+    } else if(cancelled) {
+      control_->external_pause("gripper_input_authorization_expired");
+      if(!stopping() && check(robot_.servo_move_enable(true),"gripper_cancelled_servo_resume")) servo_enabled_=true;
     } else {
       applied_trigger_=fresh.trigger;
       if (!stopping() && check(robot_.servo_move_enable(true),"gripper_servo_resume")) servo_enabled_=true;
@@ -341,7 +393,7 @@ private:
             m=snapshot(); apply_input(m);
           }
           if (stopping()) break;
-          if (control_->state()!=jaka_teleop::State::Fault && release_ready(m) &&
+          if (control_->state()!=jaka_teleop::State::Fault && release_ready(m) && trigger_request_current(m) &&
               std::fabs(m.trigger-applied_trigger_)>=trigger_deadband_) {
             service_gripper(); m=snapshot(); apply_input(m);
           }
@@ -352,6 +404,11 @@ private:
           if (d.send && servo_enabled_) {
             Record r; r.kind="servo"; r.input=m; r.decision=d; r.before=control_->submitted();
             r.start=steady_seconds(); r.interval=last_start>0 ? r.start-last_start : 0; last_start=r.start;
+            if(r.start>m.deadline && d.state==jaka_teleop::State::Tracking) {
+              control_->external_pause("source_expired_before_sdk_call");
+              d.increment={};d.state=control_->state();d.reason=control_->reason();
+              d.target_translation=control_->target().tran;r.decision=d;
+            }
             // Sole servo_p call site. Each plan constructs a fresh zero on hold.
             r.ret=robot_.servo_p(&d.increment,MoveMode::INCR,static_cast<unsigned int>(step_num_));
             r.end=steady_seconds(); control_->commit(r.ret,r.end);
@@ -386,23 +443,34 @@ private:
   std::unique_ptr<pgi140::Pgi140Gripper> gripper_;
   jaka_teleop::Config cfg_;
   std::unique_ptr<jaka_teleop::TeleopControl> control_;
+  std::unique_ptr<jaka_teleop::InputAssembler> input_;
+  bool trigger_baseline_=false;
+  std::uint64_t frame_sequence_=0;
   void apply_input(const Mailbox &m) {
-    if (m.interrupted) control_->external_pause("input_interrupted");
-    const bool tracked=input_tracked(m);
-    control_->set_pose(m.pose,m.pose_receive,tracked);
-    // Bridge sends a synthetic Grip=0 on loss. Only a fresh, matched tracked
-    // pose/Joy frame can acknowledge release; recovery with Grip still held
-    // must not silently re-engage using that synthetic release.
-    if (m.grip || release_ready(m))
-      control_->set_grip(m.grip,m.joy_receive);
+    if(m.interrupted) control_->external_pause("input_interrupted");
+    for(const auto &f:m.frames) {
+      if(steady_seconds()>f.deadline) { control_->external_pause("source_deadline_expired"); continue; }
+      control_->set_ordered_input(f.pose,f.pressed,f.pose_receive,f.joy_receive,f.deadline,++frame_sequence_);
+      // Restart preserves the gripper's unknown actual position. The first valid
+      // Trigger is only a baseline; it does not authorize a position command.
+      if(!trigger_baseline_) { applied_trigger_=f.trigger; trigger_baseline_=true; }
+    }
+    control_->set_input_deadline(m.deadline);
+    if(!input_tracked(m)) control_->external_pause("input_deadline_or_tracking");
   }
   bool input_tracked(const Mailbox &m) const {
-    return m.pose_valid && (!require_tracking_ || (m.tracked && steady_seconds()-m.tracking_receive<=cfg_.input_timeout_s));
+    return m.pose_valid && steady_seconds()<=m.deadline &&
+      (!require_tracking_ || (m.tracked && steady_seconds()-m.tracking_receive<=cfg_.input_timeout_s));
   }
   bool release_ready(const Mailbox &m) const {
-    const double t=steady_seconds();
-    return !m.grip && input_tracked(m) && m.pose_source==m.joy_source &&
-      t-m.pose_receive<=cfg_.input_timeout_s && t-m.joy_receive<=cfg_.input_timeout_s;
+    return !m.grip && m.release_valid && input_tracked(m);
+  }
+  bool trigger_request_current(const Mailbox &request) {
+    // A newer Joy may revoke an old request before its corresponding Pose has
+    // arrived. It cannot authorize a replacement action without full pairing.
+    std::lock_guard<std::mutex> lock(mail_mutex_);
+    return input_->trigger_request_current(request.source_stamp_ns,request.trigger,
+      trigger_deadband_,steady_seconds());
   }
   bool stopping() const { return stop_ || !rclcpp::ok(); }
   bool startup_wait(double seconds) const {
@@ -422,6 +490,7 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Joy>::SharedPtr joy_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr tracking_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int64>::SharedPtr input_state_sub_;
   rclcpp::TimerBase::SharedPtr log_timer_;
 };
 }

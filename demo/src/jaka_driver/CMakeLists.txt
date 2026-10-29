@@ -128,6 +128,15 @@ if(BUILD_TESTING)
   add_executable(teleop_control_test test/teleop_control_test.cpp)
   target_include_directories(teleop_control_test PRIVATE include)
   add_test(NAME teleop_control_test COMMAND teleop_control_test)
+
+  add_executable(teleop_input_test test/teleop_input_test.cpp)
+  target_include_directories(teleop_input_test PRIVATE include)
+  add_test(NAME teleop_input_test COMMAND teleop_input_test)
+
+  add_executable(pgi140_gripper_startup_test test/pgi140_gripper_startup_test.cpp
+    src/pgi140_gripper.cpp src/pgi140_protocol.cpp)
+  target_include_directories(pgi140_gripper_startup_test PRIVATE include)
+  add_test(NAME pgi140_gripper_startup_test COMMAND pgi140_gripper_startup_test)
 endif()
 
 ament_package()

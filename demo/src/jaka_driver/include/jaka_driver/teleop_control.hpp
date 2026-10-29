@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -30,12 +31,14 @@ struct Config
   double translation_speed_mm_s = 125.0; // per-axis command limits
   double translation_accel_mm_s2 = 500.0;
   double translation_deadband_mm = 0.5;
+  double translation_filter_tau_s = 0.04; // target LPF, 0 disables; independent of rotation
   double rotation_speed_rad_s = 0.1875;  // angular velocity vector norm
   double rotation_accel_rad_s2 = 0.75;
   double rotation_deadband_rad = 0.005;
   double rotation_scale = 0.5;
   double rotation_gain = 0.5;            // normalized to an 8 ms cycle
   double rotation_max_step_rad = 0.0015;
+  double rotation_workspace_rad = 2.9670597283903604; // 170 deg relative hand angle; must be < pi
   int rotation_sign = 1;
   bool use_rotation = true;
   bool enable_y_limit = true;
@@ -118,7 +121,7 @@ public:
       config.input_timeout_s, config.feedback_timeout_s,
       config.translation_speed_mm_s, config.translation_accel_mm_s2,
       config.rotation_speed_rad_s, config.rotation_accel_rad_s2,
-      config.rotation_max_step_rad, config.y_limit_mm};
+      config.rotation_max_step_rad, config.rotation_workspace_rad, config.y_limit_mm};
     for (double value : positive) {
       if (!std::isfinite(value) || value <= 0) {
         throw std::invalid_argument("teleop timing and motion limits must be finite and positive");
@@ -126,6 +129,8 @@ public:
     }
     if (config.max_interval_s < config.period_s ||
       !std::isfinite(config.translation_deadband_mm) || config.translation_deadband_mm < 0 ||
+      !std::isfinite(config.translation_filter_tau_s) || config.translation_filter_tau_s < 0 ||
+      config.rotation_workspace_rad >= 3.14159265358979323846 ||
       !std::isfinite(config.rotation_deadband_rad) || config.rotation_deadband_rad < 0 ||
       !std::isfinite(config.rotation_scale) || config.rotation_scale < 0 || config.rotation_scale > 1 ||
       !std::isfinite(config.rotation_gain) || config.rotation_gain < 0 || config.rotation_gain > 1 ||
@@ -144,6 +149,7 @@ public:
     if (!pose_valid_ && state_ == State::Tracking) {
       external_pause("tracking_lost_or_invalid_pose");
     }
+    if (pose_valid_) {enforce_rotation_workspace();}
   }
 
   void set_grip(bool pressed, double received)
@@ -158,6 +164,40 @@ public:
     }
   }
 
+  // Complete frames are assembled in source order, not callback receipt
+  // order. A newer source frame can have arrived earlier on one ROS topic.
+  // Do not reuse the independent setter receipt-order gates here: retain both
+  // original receive times for their TTL, and reject replay by frame sequence.
+  bool set_ordered_input(const ControllerPose & pose, bool pressed,
+    double pose_received, double joy_received, double deadline, std::uint64_t sequence)
+  {
+    if (state_ == State::Fault || sequence <= ordered_input_sequence_) {return false;}
+    ordered_input_sequence_ = sequence;
+    ControllerPose normalized = pose;
+    const bool valid = finite(pose.tran) && quat_normalize(pose.quat, &normalized.quat) &&
+      std::isfinite(pose_received) && pose_received >= 0 &&
+      std::isfinite(joy_received) && joy_received >= 0 && std::isfinite(deadline) &&
+      deadline >= std::max(pose_received, joy_received);
+    if (!valid) {
+      pose_valid_ = false;
+      input_deadline_ = -std::numeric_limits<double>::infinity();
+      external_pause("invalid_ordered_input");
+      return false;
+    }
+    latest_input_ = normalized;
+    pose_time_ = pose_received;
+    grip_time_ = joy_received;
+    input_deadline_ = deadline;
+    pose_valid_ = true;
+    grip_ = pressed;
+    if (!pressed) {
+      clear_residual();
+      transition(State::Hold, "grip_released");
+    }
+    enforce_rotation_workspace();
+    return true;
+  }
+
   void set_feedback(const CartesianPose & pose, double received, bool valid = true)
   {
     if (!std::isfinite(received) || received < 0 || received < feedback_time_) {return;}
@@ -165,6 +205,16 @@ public:
     feedback_ = pose;
     feedback_valid_ = valid && finite(pose.tran) &&
       std::isfinite(pose.rpy.rx) && std::isfinite(pose.rpy.ry) && std::isfinite(pose.rpy.rz);
+  }
+
+  // Source age may already be substantial on receipt. The owner converts
+  // the remaining source lifetime into this monotonic deadline; receive TTL
+  // remains an independent condition, never an extra source lifetime.
+  void set_input_deadline(double deadline)
+  {
+    input_deadline_ = (std::isfinite(deadline) ||
+      deadline == std::numeric_limits<double>::infinity()) ? deadline :
+      -std::numeric_limits<double>::infinity();
   }
 
   Decision plan(double now)
@@ -180,7 +230,8 @@ public:
       now - last_plan_time_ > config_.max_interval_s;
     last_plan_time_ = now; // never replay missed cycles
     if (overrun) {external_pause("send_interval_exceeded");}
-    const bool fresh_input = pose_valid_ && fresh(now, pose_time_, config_.input_timeout_s) &&
+    const bool fresh_input = pose_valid_ && now <= input_deadline_ &&
+      fresh(now, pose_time_, config_.input_timeout_s) &&
       fresh(now, grip_time_, config_.input_timeout_s);
     const bool fresh_feedback = feedback_valid_ &&
       fresh(now, feedback_time_, config_.feedback_timeout_s);
@@ -192,6 +243,7 @@ public:
       if (fresh_feedback) {engage();}
       else {external_pause("engagement_requires_valid_feedback");}
     }
+    enforce_rotation_workspace();
     decision.send = true; // HOLD always creates a fresh all-zero value
     if (state_ == State::Tracking) {plan_tracking(decision);}
     decision.target_translation = target_.tran;
@@ -261,6 +313,26 @@ private:
   {return std::max(lower, std::min(upper, value));}
   void transition(State next, const std::string & reason)
   {state_ = next; reason_ = reason;}
+  void enforce_rotation_workspace()
+  {
+    if (state_ == State::Tracking && config_.use_rotation) {
+      const Quaternion relative = quat_canonical(quat_normalized(quat_multiply(
+        latest_input_.quat, quat_conjugate(controller_origin_.quat))));
+      // Refuse BEFORE scaling/planning. Checking endpoint angle alone misses
+      // a dropped-frame jump +169 -> +191 deg: both canonical endpoints are
+      // inside 170 deg but their shortest connecting path crosses the cut at pi.
+      const double path_dot = relative.s * workspace_previous_.s +
+        relative.x * workspace_previous_.x + relative.y * workspace_previous_.y +
+        relative.z * workspace_previous_.z;
+      if (quat_rotation_angle(relative) > config_.rotation_workspace_rad) {
+        external_pause("rotation_workspace_exceeded");
+      } else if (path_dot < 0) {
+        external_pause("rotation_workspace_path_crossed");
+      } else {
+        workspace_previous_ = relative;
+      }
+    }
+  }
   void clear_residual()
   {
     target_ = submitted_;
@@ -269,15 +341,24 @@ private:
     planned_rotation_ = submitted_rotation_;
     velocity_ = planned_velocity_ = {{0, 0, 0}};
     angular_velocity_ = planned_angular_velocity_ = {{0, 0, 0}};
-    accepted_offset_ = {{0, 0, 0}};
+    filtered_offset_ = {{0, 0, 0}};
   }
   void engage()
   {
     controller_origin_ = latest_input_;
-    robot_origin_ = feedback_;
-    submitted_ = feedback_; // a new clutch reference must come from feedback
-    origin_rotation_ = quat_from_rpy(robot_origin_.rpy);
-    submitted_rotation_ = origin_rotation_;
+    // A query can return a 100ms cached or execution-lagged pose. Seed one
+    // command epoch only; re-clutch rebases the hand on the accepted-command
+    // history, never on later feedback. This assumes INCR accumulates on the
+    // last accepted controller command. Feedback remains a separate observer,
+    // not evidence that previously accepted increments completed or vanished.
+    if (!command_epoch_initialized_) {
+      submitted_ = feedback_;
+      submitted_rotation_ = quat_from_rpy(feedback_.rpy);
+      command_epoch_initialized_ = true;
+    }
+    robot_origin_ = submitted_;
+    origin_rotation_ = submitted_rotation_;
+    workspace_previous_ = quat_identity();
     clear_residual();
     // An out-of-range engagement must not command an unsolicited return; allow
     // motion back in, but prohibit any further outward displacement.
@@ -313,13 +394,20 @@ private:
       latest_input_.tran.y - controller_origin_.tran.y,
       latest_input_.tran.z - controller_origin_.tran.z}};
     decision.raw_translation = {raw[0], raw[1], raw[2]};
-    const double noise = std::max(std::abs(raw[0] - accepted_offset_[0]),
-      std::max(std::abs(raw[1] - accepted_offset_[1]), std::abs(raw[2] - accepted_offset_[2])));
-    // Translation noise is gated independently of rotation. The target freezes;
-    // an already accepted residual may finish, then the stream is exactly zero.
-    if (noise >= config_.translation_deadband_mm) {accepted_offset_ = raw;}
-    target_.tran = {robot_origin_.tran.x + accepted_offset_[0],
-      robot_origin_.tran.y + accepted_offset_[1], robot_origin_.tran.z + accepted_offset_[2]};
+    // Fixed clutch-relative soft deadzone: continuously map every new input
+    // outside the quiet origin region. Unlike the former moving threshold this
+    // never quantizes slow motion into repeated 0.5mm target jumps. The bounded
+    // absolute map cannot integrate noise into a random walk. A short LPF also
+    // attenuates stationary noise away from the origin; release resets it.
+    const double alpha = config_.translation_filter_tau_s > 0 ?
+      -std::expm1(-dt / config_.translation_filter_tau_s) : 1.0;
+    for (size_t i=0; i<3; ++i) {
+      const double mapped = std::copysign(std::max(0.0,
+        std::abs(raw[i]) - config_.translation_deadband_mm), raw[i]);
+      filtered_offset_[i] += alpha * (mapped - filtered_offset_[i]);
+    }
+    target_.tran = {robot_origin_.tran.x + filtered_offset_[0],
+      robot_origin_.tran.y + filtered_offset_[1], robot_origin_.tran.z + filtered_offset_[2]};
     if (config_.enable_y_limit) {
       target_.tran.y = config_.arm_is_right ? std::min(y_barrier_, target_.tran.y) :
         std::max(y_barrier_, target_.tran.y);
@@ -398,17 +486,21 @@ private:
   State state_ = State::Hold;
   std::string reason_ = "startup_hold";
   bool grip_ = false, pose_valid_ = false, feedback_valid_ = false, pending_ = false;
+  bool command_epoch_initialized_ = false;
   double pose_time_ = -std::numeric_limits<double>::infinity();
   double grip_time_ = -std::numeric_limits<double>::infinity();
   double feedback_time_ = -std::numeric_limits<double>::infinity();
   double last_plan_time_ = std::numeric_limits<double>::quiet_NaN();
+  double input_deadline_ = std::numeric_limits<double>::infinity();
+  std::uint64_t ordered_input_sequence_ = 0;
   ControllerPose latest_input_, controller_origin_;
   CartesianPose robot_origin_{}, submitted_{}, target_{}, planned_{}, feedback_{};
   Quaternion origin_rotation_ = quat_identity(), submitted_rotation_ = quat_identity();
   Quaternion target_rotation_ = quat_identity(), planned_rotation_ = quat_identity();
+  Quaternion workspace_previous_ = quat_identity();
   Vector3 velocity_{{0, 0, 0}}, planned_velocity_{{0, 0, 0}};
   Vector3 angular_velocity_{{0, 0, 0}}, planned_angular_velocity_{{0, 0, 0}};
-  Vector3 accepted_offset_{{0, 0, 0}};
+  Vector3 filtered_offset_{{0, 0, 0}};
   double y_barrier_ = 0;
   int fault_code_ = 0;
   double fault_time_ = 0;

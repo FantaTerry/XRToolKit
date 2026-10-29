@@ -5,6 +5,11 @@ xrt_teleop_bridge:
     button_topic: /rc_ctrl/button
     left_tracking_topic: /rc_ctrl/left_tracking
     right_tracking_topic: /rc_ctrl/right_tracking
+    # Authoritative recovery generation: +first recovered ROS stamp_ns;
+    # -first observed loss ROS stamp_ns. Repeated unchanged within a generation.
+    # Bool tracking remains diagnostic; source ROS time must advance across epochs.
+    left_input_state_topic: /rc_ctrl/left_input_state
+    right_input_state_topic: /rc_ctrl/right_input_state
     publish_rate: 125.0
     # get_time_stamp_ns progress, measured with monotonic local time. Stationary
     # controller poses remain valid while source timestamps advance.

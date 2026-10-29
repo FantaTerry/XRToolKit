@@ -13,6 +13,8 @@
     translation_speed_mm_s: 125.0
     translation_accel_mm_s2: 500.0
     translation_deadband_mm: 0.5
+    translation_filter_tau_s: 0.04
+    rotation_workspace_rad: 2.9670597283903604
     rotation_speed_rad_s: 0.1875
     rotation_accel_rad_s2: 0.75
     # Existing orientation, Grip hysteresis and enable_y_limit launch arguments

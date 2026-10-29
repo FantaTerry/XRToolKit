@@ -70,6 +70,10 @@ BUTTON_ORDER = (
     "LJ", "RJ", "LG", "RG", "LTr", "RTr",
 )
 
+# Appended metadata never changes the legacy button/axis indices. The control
+# owner requires these explicit flags; a missing flag cannot authorize release.
+VALIDITY_BUTTON_ORDER = ("LGValid", "RGValid", "LTrValid", "RTrValid")
+
 
 def _clamp(value, low, high):
     return max(low, min(high, float(value)))
@@ -279,7 +283,7 @@ def _axis_pair(value):
 
 
 def joy_payload(left, right, grip_threshold=0.5):
-    """Create the stable Joy layout consumed by the copied JAKA and AMR nodes."""
+    """Keep legacy Joy axes/buttons and append read-validity at buttons[12:16]."""
     left_grip = _clamp(left.get("grip", 0.0), 0.0, 1.0)
     right_grip = _clamp(right.get("grip", 0.0), 0.0, 1.0)
     left_trigger = _clamp(left.get("trigger", 0.0), 0.0, 1.0)
@@ -312,4 +316,7 @@ def joy_payload(left, right, grip_threshold=0.5):
         "RTr": right_trigger > grip_threshold,
     }
     buttons = [1 if button_values[name] else 0 for name in BUTTON_ORDER]
+    buttons.extend(int(bool(valid)) for valid in (
+        left.get("grip_valid", False), right.get("grip_valid", False),
+        left.get("trigger_valid", False), right.get("trigger_valid", False)))
     return axes, buttons

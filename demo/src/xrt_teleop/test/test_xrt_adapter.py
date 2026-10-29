@@ -69,11 +69,20 @@ class XrtAdapterTest(unittest.TestCase):
             },
         )
         self.assertEqual(axes, [0.8, 0.2, 0.25, 0.9, 0.1, -0.2, -0.3, 0.4])
-        self.assertEqual(len(buttons), len(BUTTON_ORDER))
+        self.assertEqual(len(buttons), len(BUTTON_ORDER) + 4)
+        self.assertEqual(buttons[12:16], [0, 0, 0, 0])
         self.assertEqual(buttons[BUTTON_ORDER.index("X")], 1)
         self.assertEqual(buttons[BUTTON_ORDER.index("LG")], 1)
         self.assertEqual(buttons[BUTTON_ORDER.index("RG")], 0)
         self.assertEqual(buttons[BUTTON_ORDER.index("RTr")], 1)
+
+    def test_joy_read_validity_does_not_change_legacy_values(self):
+        axes, buttons = joy_payload(
+            {"grip": 0.9, "trigger": 0.8, "grip_valid": False, "trigger_valid": True},
+            {"grip": 0.0, "trigger": 0.1, "grip_valid": True, "trigger_valid": False})
+        self.assertEqual(axes[:4], [0.9, 0.0, 0.8, 0.1])
+        self.assertEqual(buttons[12:16], [0, 1, 1, 0])
+        self.assertEqual(buttons[8:12], [1, 0, 1, 0])
 
     def test_smoothing_spans_between_samples(self):
         position, _ = smooth_pose(
