@@ -291,8 +291,8 @@ private:
     if (!check(robot_.login_in(ip_.c_str()),"login_in")) return false;
     connected_=true; read_configuration();
     if (stopping()) return false;
-    if (!check(robot_.set_status_data_update_time_interval(100),"status_interval_100ms") ||
-        !check(robot_.set_block_wait_timeout(120),"block_wait_timeout")) return false;
+    // These two legacy SDK setters are only for versions before v2.1.12.
+    // Current SDKs return ERR_OBSOLETE; feedback polling uses feedback_period_.
     RobotStatus_simple s{};
     if (!check(robot_.get_robot_status_simple(&s),"startup_status")) return false;
     if (s.errcode) { control_->fault(s.errcode,steady_seconds(),"startup_controller_error"); return false; }

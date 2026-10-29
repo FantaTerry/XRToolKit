@@ -140,8 +140,8 @@ errno_t JAKAZuRobot::power_on() {fake::add("power_on");return 0;}
 errno_t JAKAZuRobot::enable_robot() {fake::add("enable_robot");return 0;}
 errno_t JAKAZuRobot::clear_error() {fake::add("clear_error");return 0;}
 errno_t JAKAZuRobot::collision_recover() {fake::add("collision_recover");return 0;}
-errno_t JAKAZuRobot::set_status_data_update_time_interval(float) {fake::add("status_interval");return 0;}
-errno_t JAKAZuRobot::set_block_wait_timeout(float) {fake::add("block_timeout");return 0;}
+errno_t JAKAZuRobot::set_status_data_update_time_interval(float) {fake::add("status_interval");return ERR_OBSOLETE;}
+errno_t JAKAZuRobot::set_block_wait_timeout(float) {fake::add("block_timeout");return ERR_OBSOLETE;}
 errno_t JAKAZuRobot::get_sdk_version(char *v) {fake::add("version");std::strcpy(v,"OFFLINE_FAKE");return 0;}
 errno_t JAKAZuRobot::get_user_frame_id(int *v) {fake::add("user_id");*v=15;return 0;}
 errno_t JAKAZuRobot::get_tool_id(int *v) {fake::add("tool_id");*v=15;return 0;}

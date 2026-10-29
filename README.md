@@ -1043,7 +1043,7 @@ Y 边界在与反馈/INCR 平移相同的假定参考系内同时限制目标和
 | `grip_press/release_threshold` | 0.6 / 0.4 | 保留滞回；实际比较为 >，释放条件为 ≤ release |
 | `input_timeout_s` / `max_source_age_s` | 0.2 / 0.2 s | 将源剩余有效期转换为单调截止点，执行/接合/夹爪均检查；跨机需同步，未来容差 50 ms |
 | `require_tracking` | true | 要求 Int64 输入状态心跳未超时；false 仅关闭该心跳年龄检查，仍须有效源恢复屏障，不能跳过代次隔离 |
-| `feedback_period_s` / `feedback_timeout_s` | 0.1 / 0.3 s | SDK 状态缓存设置 100 ms；反馈年龄为查询接收年龄，无硬件采样时刻保证 |
+| `feedback_period_s` / `feedback_timeout_s` | 0.1 / 0.3 s | 本地每 100 ms 查询，不修改 SDK 状态缓存周期；反馈年龄为查询接收年龄，无硬件采样时刻保证 |
 | `y_limit_mm` / `enable_y_limit` | 110 mm / true | 保留现场原单轴边界，参考系仍待确认 |
 | `gripper_call_timeout_s` | 0.25 s | 退出 servo 后同步 IO 的返回耗时门限；超时锁存，不恢复 servo；不是可取消的 SDK 超时 |
 | `diagnostic_dir` | `log/teleop` | run_teleop 先切到 demo；直接 ros2 启动也应从 demo 执行或指定 demo 内绝对路径 |
