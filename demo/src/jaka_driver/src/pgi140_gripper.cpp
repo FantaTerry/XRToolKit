@@ -41,6 +41,7 @@ bool Pgi140Gripper::write_register(uint16_t address, uint16_t value, std::string
     static_cast<uint8_t>(config_.slave_id), address, value);
   const int ret = robot_.send_tio_rs_command(
     config_.rs485_channel, frame.data(), static_cast<int>(frame.size()));
+  last_sdk_return_ = ret;
   if (ret != ERR_SUCC) {
     return fail(
       "send_tio_rs_command failed, return code " + std::to_string(ret), error);

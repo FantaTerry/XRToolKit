@@ -10,4 +10,6 @@ source "${_run_demo_dir}/setup.zsh"
 "${_run_demo_dir}/launch_quest.zsh" || \
   print -u2 "自动启动 Quest APK 失败，请检查 adb；ROS 遥操作仍会继续启动。"
 
+# Keep generated ROS and buffered teleop diagnostics inside demo/.
+cd "${_run_demo_dir}"
 exec ros2 launch jaka_driver dual_arm_teleop.launch.py "$@"

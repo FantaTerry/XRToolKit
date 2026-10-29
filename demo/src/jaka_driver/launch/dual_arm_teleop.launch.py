@@ -7,6 +7,10 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    control_config_arg = DeclareLaunchArgument(
+        'control_config',
+        default_value=PathJoinSubstitution([FindPackageShare('jaka_driver'), 'config', 'teleop_control.yaml']),
+        description='JAKA servo timing, trajectory and filter configuration')
     # Forwarded to RC_ctrl.launch.py so the arm IPs can be overridden from here,
     # e.g.  ros2 launch jaka_driver dual_arm_teleop.launch.py robot_left_ip:=192.168.71.36
     robot_left_ip_arg = DeclareLaunchArgument(
@@ -120,6 +124,7 @@ def generate_launch_description():
             PathJoinSubstitution([FindPackageShare('jaka_driver'), 'launch', 'RC_ctrl.launch.py'])
         ]),
         launch_arguments={
+            'control_config': LaunchConfiguration('control_config'),
             'robot_left_ip': LaunchConfiguration('robot_left_ip'),
             'robot_right_ip': LaunchConfiguration('robot_right_ip'),
             'gripper_force': LaunchConfiguration('gripper_force'),
@@ -153,6 +158,7 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        control_config_arg,
         robot_left_ip_arg,
         robot_right_ip_arg,
         gripper_force_arg,

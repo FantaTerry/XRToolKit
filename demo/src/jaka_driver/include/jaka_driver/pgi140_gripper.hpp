@@ -45,6 +45,7 @@ public:
   bool Grip(float grip, std::string * error = nullptr);
 
   bool closed() const { return closed_; }
+  int last_sdk_return() const { return last_sdk_return_; }
   const GripperConfig & config() const { return config_; }
 
 private:
@@ -55,6 +56,7 @@ private:
   GripperConfig config_;
   bool configured_ = false;
   bool closed_ = false;
+  int last_sdk_return_ = 0; // raw result of the most recent synchronous TIO write
 };
 
 }  // namespace pgi140

@@ -66,12 +66,18 @@ def main(argv=None):
     )
     try:
         while deadline is None or time.monotonic() < deadline:
+            try:
+                source_ns = xrt.get_time_stamp_ns()
+            except (AttributeError, RuntimeError, TypeError):
+                source_ns = "unavailable"
             left_pose = xrt.get_left_controller_pose()
             right_pose = xrt.get_right_controller_pose()
             print(
-                "left:  %s grip=%.3f trigger=%.3f | "
+                "source_ns=%s receipt_mono_s=%.6f | left:  %s grip=%.3f trigger=%.3f | "
                 "right: %s grip=%.3f trigger=%.3f"
                 % (
+                    source_ns,
+                    time.monotonic(),
                     _pose_text(left_pose),
                     _float(xrt.get_left_grip()),
                     _float(xrt.get_left_trigger()),

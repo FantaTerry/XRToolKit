@@ -3,6 +3,7 @@ import unittest
 
 from xrt_teleop.xrt_adapter import (
     DEFAULT_HEADSET_TO_ROBOT,
+    SourceFreshness,
     BUTTON_ORDER,
     joy_payload,
     matrix_3x3,
@@ -82,6 +83,43 @@ class XrtAdapterTest(unittest.TestCase):
             0.5,
         )
         self.assertEqual(position, (0.5, 1.0, 1.5))
+
+    def test_smoothing_preserves_equivalent_quaternion_signs(self):
+        previous = ((0.1, 0.2, 0.3), (0.5, 0.5, 0.5, 0.5))
+        position, quat = smooth_pose(previous, previous[0], (-0.5,) * 4, 0.4)
+        self.assertEqual(position, previous[0])
+        self.assertEqual(quat, previous[1])
+
+    def test_source_progress_is_independent_of_stationary_pose(self):
+        source = SourceFreshness(timeout_s=0.2)
+        for frame in range(100):
+            self.assertEqual(source.observe(1000 + frame, frame * 0.01), (True, True))
+
+    def test_duplicate_source_does_not_refresh_age(self):
+        source = SourceFreshness(timeout_s=0.2)
+        self.assertEqual(source.observe(1000, 1.0), (True, True))
+        self.assertEqual(source.observe(1000, 1.1), (True, False))
+        self.assertEqual(source.observe(1000, 1.201), (False, False))
+        self.assertEqual(source.last_advance_s, 1.0)
+        self.assertEqual(source.observe(1001, 1.21), (True, True))
+
+    def test_source_rollback_invalidates_frame(self):
+        source = SourceFreshness()
+        self.assertEqual(source.observe(1000, 1.0), (True, True))
+        self.assertEqual(source.observe(500, 1.1), (False, False))
+        self.assertEqual(source.observe(500, 1.12), (False, False))
+        self.assertEqual(source.observe(501, 1.13), (True, True))
+
+    def test_source_missing_is_fail_closed_unless_explicit_fallback(self):
+        self.assertEqual(SourceFreshness().observe(None, 1.0, False), (False, False))
+        fallback = SourceFreshness(require_timestamp=False)
+        self.assertEqual(fallback.observe(None, 1.0, False), (True, True))
+        # A present getter that fails is not silently replaced by receipt time.
+        self.assertEqual(fallback.observe(None, 1.0, True), (False, False))
+
+    def test_invalid_source_values(self):
+        for invalid in (None, 0, -1, True, 1.25, float("nan"), float("inf"), "oops"):
+            self.assertEqual(SourceFreshness().observe(invalid, 1.0), (False, False))
 
 
 if __name__ == "__main__":

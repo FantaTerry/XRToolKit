@@ -1,0 +1,35 @@
+/**:
+  ros__parameters:
+    # Command horizon is servo_step_num * 8 ms. No missed-cycle catch-up.
+    servo_step_num: 1
+    max_servo_interval_s: 0.032
+    input_timeout_s: 0.2
+    max_source_age_s: 0.2
+    require_tracking: true
+    feedback_period_s: 0.1
+    feedback_timeout_s: 0.3
+    # Software command limits. Translation limits are per axis, angular limits
+    # are vector norms. These are commissioning defaults, not S5 ratings.
+    translation_speed_mm_s: 125.0
+    translation_accel_mm_s2: 500.0
+    translation_deadband_mm: 0.5
+    rotation_speed_rad_s: 0.1875
+    rotation_accel_rad_s2: 0.75
+    # Existing orientation, Grip hysteresis and enable_y_limit launch arguments
+    # remain authoritative; adjust them on the launch command line.
+    y_limit_mm: 110.0
+    # Select exactly one: carte_nlf | none | speed_foresight.
+    # Preserve field filter values until separate controller commissioning.
+    servo_filter: carte_nlf
+    nlf_translation_speed_mm_s: 1500.0
+    nlf_translation_accel_mm_s2: 2500.0
+    nlf_translation_jerk_mm_s3: 2800.0
+    nlf_rotation_speed_deg_s: 1120.0
+    nlf_rotation_accel_deg_s2: 1180.0
+    nlf_rotation_jerk_deg_s3: 1720.0
+    foresight_buffer: 10
+    foresight_kp: 0.5
+    # Trigger is coalesced while Grip held. IO runs outside servo after release.
+    # Timeout is detected on return; supplied SDK cannot cancel an in-flight IO.
+    gripper_call_timeout_s: 0.25
+    diagnostic_dir: log/teleop

@@ -84,6 +84,8 @@ link_directories(${LIBRARY_DIR})
 # Find the library and link it properly
 target_link_libraries(jaka_driver ${LIBRARY_DIR}/libjakaAPI.so)
 target_link_libraries(rc_ctrl_node ${LIBRARY_DIR}/libjakaAPI.so)
+find_package(Threads REQUIRED)
+target_link_libraries(rc_ctrl_node Threads::Threads)
 set_target_properties(jaka_driver rc_ctrl_node PROPERTIES
   BUILD_RPATH "${LIBRARY_DIR}"
   INSTALL_RPATH "$ORIGIN"
@@ -106,6 +108,9 @@ install(FILES lib/libjakaAPI.so
 install(DIRECTORY launch/
   DESTINATION share/${PROJECT_NAME}/launch
 )
+install(DIRECTORY config/
+  DESTINATION share/${PROJECT_NAME}/config
+)
 
 if(BUILD_TESTING)
   enable_testing()
@@ -119,6 +124,10 @@ if(BUILD_TESTING)
   add_executable(orientation_math_test test/orientation_math_test.cpp)
   target_include_directories(orientation_math_test PRIVATE include)
   add_test(NAME orientation_math_test COMMAND orientation_math_test)
+
+  add_executable(teleop_control_test test/teleop_control_test.cpp)
+  target_include_directories(teleop_control_test PRIVATE include)
+  add_test(NAME teleop_control_test COMMAND teleop_control_test)
 endif()
 
 ament_package()

@@ -9,9 +9,11 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
 from sensor_msgs.msg import Joy
+from std_msgs.msg import Bool
 
 from xrt_teleop.xrt_adapter import (
     DEFAULT_HEADSET_TO_ROBOT,
+    SourceFreshness,
     joy_payload,
     matrix_3x3,
     normalize_quaternion,
@@ -51,6 +53,18 @@ class XrtTeleopBridge(Node):
         self.input_log_period = float(
             self.declare_parameter("input_log_period", 5.0).value
         )
+        self.source_timeout_s = float(
+            self.declare_parameter("source_timeout_s", 0.2).value
+        )
+        self.require_source_timestamp = bool(
+            self.declare_parameter("require_source_timestamp", True).value
+        )
+        self.left_tracking_topic = str(self.declare_parameter(
+            "left_tracking_topic", "/rc_ctrl/left_tracking"
+        ).value)
+        self.right_tracking_topic = str(self.declare_parameter(
+            "right_tracking_topic", "/rc_ctrl/right_tracking"
+        ).value)
         self.enable_left = bool(
             self.declare_parameter("enable_left", True).value
         )
@@ -93,6 +107,10 @@ class XrtTeleopBridge(Node):
         self.button_publisher = self.create_publisher(
             Joy, self.button_topic, qos
         )
+        self.tracking_publishers = {
+            "left": self.create_publisher(Bool, self.left_tracking_topic, qos),
+            "right": self.create_publisher(Bool, self.right_tracking_topic, qos),
+        }
 
         self._filtered = {"left": None, "right": None}
         self._pose_was_valid = {"left": False, "right": False}
@@ -101,7 +119,31 @@ class XrtTeleopBridge(Node):
         self._last_input_log_time = 0.0
         self._xrt = None
         self._sdk_initialized = False
+        self._source = SourceFreshness(
+            self.source_timeout_s, self.require_source_timestamp
+        )
+        self._source_stamp = None
+        self._cached_states = {"left": {}, "right": {}}
+        self._poll_count = 0
+        self._source_count = 0
+        self._pose_counts = {"left": 0, "right": 0}
+        self._rate_started_s = time.monotonic()
         self._initialize_sdk()
+        self._has_source_timestamp = callable(
+            getattr(self._xrt, "get_time_stamp_ns", None)
+        )
+        if not self._has_source_timestamp:
+            self.get_logger().warning(
+                "SDK lacks get_time_stamp_ns; require_source_timestamp=%s. "
+                "Receipt-only fallback cannot detect cached nonzero poses."
+                % self.require_source_timestamp
+            )
+        self.get_logger().info(
+            "Source freshness: timestamp=%s timeout=%.3fs; controller tracking "
+            "uses valid-pose sentinel (no per-controller tracking flag in the "
+            "reviewed Python API). SDK getters do not provide an atomic snapshot."
+            % (self._has_source_timestamp, self.source_timeout_s)
+        )
 
         self.timer = self.create_timer(1.0 / self.publish_rate, self._publish)
         self.get_logger().info(
@@ -215,7 +257,9 @@ class XrtTeleopBridge(Node):
 
     def _pose_message(self, position, quaternion):
         message = PoseStamped()
-        message.header.stamp = self.get_clock().now().to_msg()
+        # This is the local receipt time of a new source timestamp. Source
+        # clock epoch is unspecified and must not be cast to a ROS timestamp.
+        message.header.stamp = self._source_stamp
         message.header.frame_id = self.robot_base_frame
         message.pose.position.x = position[0]
         message.pose.position.y = position[1]
@@ -237,6 +281,8 @@ class XrtTeleopBridge(Node):
                 )
             self._pose_was_valid[side] = False
             return
+        if not state["new_frame"]:
+            return
 
         position, quaternion = transform_pose(
             state["pose"],
@@ -250,14 +296,42 @@ class XrtTeleopBridge(Node):
         )
         self._filtered[side] = filtered
         publisher.publish(self._pose_message(*filtered))
+        self._pose_counts[side] += 1
 
         if not self._pose_was_valid[side]:
             self.get_logger().info("%s controller tracking acquired" % side)
         self._pose_was_valid[side] = True
 
     def _publish(self):
-        left = self._controller_state("left") if self.enable_left else {}
-        right = self._controller_state("right") if self.enable_right else {}
+        now = time.monotonic()
+        self._poll_count += 1
+        source_ns = self._safe_value("get_time_stamp_ns", None)
+        fresh, new_frame = self._source.observe(
+            source_ns, now, self._has_source_timestamp
+        )
+        if fresh and new_frame:
+            # Read each getter once per source frame. In particular, do not
+            # repeatedly smooth/re-stamp the same cached pose at timer rate.
+            self._source_stamp = self.get_clock().now().to_msg()
+            self._source_count += 1
+            for side, enabled in (("left", self.enable_left), ("right", self.enable_right)):
+                self._cached_states[side] = self._controller_state(side) if enabled else {}
+        states = {}
+        for side, enabled in (("left", self.enable_left), ("right", self.enable_right)):
+            state = dict(self._cached_states[side]) if enabled else {}
+            state["pose_valid"] = fresh and bool(state.get("pose_valid", False))
+            state["new_frame"] = fresh and new_frame
+            if not state["pose_valid"]:
+                # Neutral Grip on disconnect; retain the last accepted trigger
+                # so loss of tracking does not open a closed gripper.
+                state.update(grip=0.0, trigger=self._last_valid_trigger[side],
+                             axis=(0.0, 0.0), X=False, Y=False, A=False, B=False,
+                             menu=False, axis_click=False)
+            states[side] = state
+            tracking = Bool()
+            tracking.data = state["pose_valid"]
+            self.tracking_publishers[side].publish(tracking)
+        left, right = states["left"], states["right"]
 
         if self.enable_left:
             self._publish_pose("left", left)
@@ -266,7 +340,10 @@ class XrtTeleopBridge(Node):
 
         axes, buttons = joy_payload(left, right, self.grip_threshold)
         joy = Joy()
-        joy.header.stamp = self.get_clock().now().to_msg()
+        joy.header.stamp = (
+            self._source_stamp if fresh and self._source_stamp is not None
+            else self.get_clock().now().to_msg()
+        )
         joy.axes = axes
         joy.buttons = buttons
         # Publish continuously so rc_ctrl receives the current Grip state even
@@ -274,18 +351,20 @@ class XrtTeleopBridge(Node):
         # are still powering on and entering servo mode.
         self.button_publisher.publish(joy)
 
-        now = time.monotonic()
         if (
             self.input_log_period > 0.0
             and now - self._last_input_log_time >= self.input_log_period
-            and (
-                left.get("pose_valid", False)
-                or right.get("pose_valid", False)
-            )
         ):
+            elapsed = max(now - self._rate_started_s, 1e-9)
+            age = (
+                now - self._source.last_advance_s
+                if self._source.last_advance_s is not None else float("inf")
+            )
             self.get_logger().info(
                 "Quest input: left tracked=%s grip=%.3f trigger=%.3f | "
-                "right tracked=%s grip=%.3f trigger=%.3f"
+                "right tracked=%s grip=%.3f trigger=%.3f | source_ns=%s "
+                "receipt_mono_s=%s age_s=%.3f status=%s "
+                "poll_hz=%.1f source_hz=%.1f pose_hz=(%.1f,%.1f)"
                 % (
                     left.get("pose_valid", False),
                     left.get("grip", 0.0),
@@ -293,9 +372,20 @@ class XrtTeleopBridge(Node):
                     right.get("pose_valid", False),
                     right.get("grip", 0.0),
                     right.get("trigger", 0.0),
+                    self._source.last_source_ns,
+                    self._source.last_advance_s,
+                    age,
+                    self._source.reason,
+                    self._poll_count / elapsed,
+                    self._source_count / elapsed,
+                    self._pose_counts["left"] / elapsed,
+                    self._pose_counts["right"] / elapsed,
                 )
             )
             self._last_input_log_time = now
+            self._rate_started_s = now
+            self._poll_count = self._source_count = 0
+            self._pose_counts = {"left": 0, "right": 0}
 
         if (
             not left.get("pose_valid", False)

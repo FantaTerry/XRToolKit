@@ -1,5 +1,7 @@
 # Quest 3 + XRoboToolKit 控制 JAKA 双臂与 AMR 底盘
 
+本轮控制链路修复及离线验证记录见文末“伺服连续性修复”。上线前必须按该节核对新增参数和行为变化。
+
 本工程是 `RemoteCtrl-master` 的 XRoboToolKit 迁移版。Quest 3 不再通过旧 APK 的
 adb/logcat 文本传输位姿，而是运行 `XRoboToolkit-Quest-1.0.1.apk`，由
 `XRoboToolkit-PC-Service` 接收头显数据；`xrt_teleop` 再把数据转换成本工程原有的
@@ -113,22 +115,17 @@ cd "$HOME/Documents/dj_main/XRToolKit/demo"
 [INFO] ... xrt_teleop_bridge: XRoboToolkit bridge started
 [INFO] ... xrt_teleop_bridge: left controller tracking acquired
 [INFO] ... xrt_teleop_bridge: right controller tracking acquired
-[INFO] ... [rc_ctrl]: left login OK (192.168.71.37)
-[INFO] ... [rc_ctrl]: right login OK (192.168.71.36)
-[INFO] ... [rc_ctrl]: left power_on OK
-[INFO] ... [rc_ctrl]: right power_on OK
-[INFO] ... [rc_ctrl]: left enable_robot OK
-[INFO] ... [rc_ctrl]: right enable_robot OK
-[INFO] ... [rc_ctrl]: left servo enabled (is_in_servomove=1)
-[INFO] ... [rc_ctrl]: right servo enabled (is_in_servomove=1)
-[INFO] ... [rc_ctrl]: rc_ctrl_node started
+[INFO] ... [left] login_in ret=0
+[INFO] ... [right] login_in ret=0
+[INFO] ... [left] servo_move_enable ret=0
+[INFO] ... [right] servo_move_enable ret=0
 ```
 
-只有左右两臂都出现 `servo enabled` 后才继续启动 D405。如果任一臂出现
+只有左右两臂都出现 `servo_move_enable ret=0` 且没有锁存故障后才继续启动 D405。如果任一臂出现
 `ERR_INVALID_HANDLER`、`ERR_NOT_ENABLED` 或无法进入伺服模式，先处理机械臂问题，不要
 继续测试视频。
 
-保持终端 B 运行。机械臂空载时按住一次右手柄 Grip，轻微移动后松开，确认右臂能跟随并
+保持终端 B 运行。启动后先松开两侧 Grip，再重新按住。机械臂空载时按住右手柄 Grip，轻微移动后松开，确认右臂能跟随并
 停止；再按同样方法测试左臂。不要在运动范围未确认时测试。
 
 ### 5. 终端 C：确认没有旧视频进程，再启动 D405
@@ -177,7 +174,9 @@ D405 发送端的 JAKA 主机地址，不能是 JAKA 控制器 `192.168.71.36/37
    `Streaming D405` 和持续增加的 `Video sent: frames=...`。
 
 此时双臂遥操作和 D405 画面应同时工作。左手柄 Grip 控制左臂，右手柄 Grip 控制右臂，
-松开 Grip 后停止；左手 Trigger 控制左夹爪，右手 Trigger 控制右夹爪。
+松开 Grip 后清除未完成目标并保持；左手 Trigger 控制左夹爪，右手 Trigger 控制右夹爪。
+本轮修复将握持期间的 Trigger 合并为最新值，松开 Grip 且跟踪新鲜时才执行夹爪同步通信；
+执行前显式退出伺服，完成后恢复零增量保持。不要依赖握持运动期间夹爪立即动作。
 
 `xrt_teleop_bridge` 每 5 秒打印一次原始输入，例如：
 
@@ -188,14 +187,13 @@ Quest input: left tracked=True grip=0.000 trigger=0.000 | right tracked=True gri
 按住右手 Grip 后应变成接近 `1.000`，并在对应 `rc_ctrl` 终端依次看到：
 
 ```text
-[right] Grip pressed (raw=1.000, press>0.60 release<0.40)
-[right] gripped, ctrl_origin=(...), 6D=true
+[right] state 0 -> 1 reason=fresh_grip_reference fault=0 ...
 ```
 
 松开后应看到：
 
 ```text
-[right] Grip released (raw=0.000, press>0.60 release<0.40)
+[right] state 1 -> 0 reason=grip_released fault=0 ...
 ```
 
 左臂同理。Grip 状态现在由 `xrt_teleop_bridge` 以 125 Hz 持续发布，不再只在数值变化
@@ -474,7 +472,7 @@ Quest 手柄四元数
   -> JAKA servo_p(INCR) 的 rx/ry/rz
 ```
 
-手柄每帧姿态已在 `xrt_teleop` 中转成机器人基坐标系。默认只映射一半的手柄相对旋转，
+手柄每个新源帧姿态在 `xrt_teleop` 中应用共用坐标映射；其与两臂现场用户坐标系的对应关系仍须标定核查。默认只映射一半的手柄相对旋转，
 并在每个控制周期以较小的角速度跟随。JAKA 驱动会保留尚未完成的旋转，避免快速转动
 时直接丢失目标。
 
@@ -482,14 +480,14 @@ Quest 手柄四元数
 | --- | --- | --- |
 | `use_rpy_ctrl` | `true` | `true` 为 6D；`false` 只控制 XYZ |
 | `rotation_scale` | `0.5` | 手柄相对旋转映射到机械臂的比例，范围 0..1 |
-| `rotation_gain` | `0.5` | 每个周期执行剩余旋转的比例，范围 0..1 |
+| `rotation_gain` | `0.5` | 以 8 ms 为基准的剩余旋转比例，其他周期按时间归一化，范围 0..1 |
 | `rotation_deadband_rad` | `0.005` | 姿态死区，约 0.29° |
-| `rotation_max_step_rad` | `0.0015` | 每 8 ms 最大旋转，约 10.7°/s |
+| `rotation_max_step_rad` | `0.0015` | 每次指令最大旋转，另受角速度和角加速度限制；8 ms 时约 10.7°/s |
 | `rotation_sign` | `1` | 全部旋转轴的统一方向；方向整体相反时设为 `-1` |
 | `grip_press_threshold` | `0.6` | Grip 达到该值才进入控制 |
 | `grip_release_threshold` | `0.4` | Grip 低于该值才释放控制 |
 
-旋转使用机器人基坐标系的增量 RPY。若手柄绕某个轴转动时机械臂三个旋转轴都朝相反
+实现保留参考系中左乘旋转、`Rz Ry Rx` 转 RPY 的明确假设；附带 SDK 未写明 INCR 姿态组合方向，需厂商或官方仿真确认。若手柄绕某个轴转动时机械臂三个旋转轴都朝相反
 方向运动，可先用 `rotation_sign:=-1` 验证；若只有某两个轴交换或部分方向异常，应
 修改 `xrt_bridge.yaml` 的 `headset_to_robot` / `tf_rotation`，不要把 `rotation_sign`
 当作单轴反号参数。
@@ -509,9 +507,10 @@ Quest 手柄四元数
 
 ## 松开 Grip 后的保持
 
-JAKA `servo_p` 是直接面向伺服的连续控制接口，只发送一次零增量不能保证队列耗尽后
-完全静止。当前驱动在松开 Grip 后继续以 125 Hz 发送全零增量，等价于持续保持最后一
-个稳定目标；按下 Grip 后立即停止保持流并开始新的相对运动。
+JAKA `servo_p` 使用同一个 SDK 所有者循环发送。握持静止、平移在死区内和松手后的正常保持
+都按 `step_num × 8 ms` 生成新的零 INCR，不重放上一条非零指令。Grip 松开立即丢弃尚未
+提交的平移和姿态残差。夹爪维护时先退出伺服；故障时停止发送并退出，均有明确状态记录。
+松手/失联时软件轨迹速度状态清零，实际停止过程依赖控制器滤波及退出伺服行为，须现场验证。
 
 Grip 使用 `0.6` 按下、`0.4` 松开的回差，避免模拟量在 `0.5` 附近波动时反复触发
 离合器。若现场 Grip 数值范围不同，可同时调整：
@@ -838,13 +837,14 @@ ros2 topic echo /rc_ctrl/right_target --once
 头显未跟踪到手柄时，`xrt_teleop` 不发布对应位姿，并发布 Grip=0 使机械臂停止；
 Trigger 保持最后一次有效值，避免跟踪中断时夹爪突然动作。Joy 现在持续发布，
 `ros2 topic hz /rc_ctrl/button` 应显示接近 125 Hz。按住 Grip 后，bridge 与 `rc_ctrl`
-日志应分别出现原始 Grip 数值、`Grip pressed` 和 `gripped`。
+日志应分别出现原始 Grip 数值和 `reason=fresh_grip_reference`。位姿频率取决于实际新源帧，
+不再由发布定时器把缓存帧伪装成新数据；`source_hz`、`pose_hz` 和实际 servo CSV 间隔须分别核查。
 
 ## 安全注意事项
 
 - 首次运行前清空双臂运动范围，确认急停可用，人员不要进入机械臂工作空间。
 - 先分别测试左臂和右臂，使用低速度、低夹爪力度，再双人复核后同时操作。
-- Grip 是离合器：按住时才跟踪，松开后立即停止增量伺服。
+- Grip 是离合器：按住时才跟踪，松开后清除残差并持续发送零增量保持；不执行故障恢复。
 - 默认启用 6D 姿态控制；首次调试旋转时必须空载并限制
   `rotation_scale` / `rotation_gain` / `rotation_max_step_rad`。
 - `gripper_initialize:=true` 会让夹爪执行初始化动作；维修或首次接线时先确认安全。
@@ -957,20 +957,203 @@ cd "$HOME/Documents/dj_main/XRToolKit/demo"
    必须从 0 变为接近 1。
 2. 正常运行 `run_teleop.zsh` 时，bridge 日志 `Quest input` 中的 `grip` 应随 Grip
    变化；若一直为 0，问题在 APK、PC-service 或手柄输入。
-3. 按 Grip 后 `rc_ctrl` 必须打印 `Grip pressed`；没有这一行说明 Joy 没有到达控制节点。
-4. 有 `Grip pressed` 后必须继续打印 `gripped`；没有则检查 JAKA 伺服重新使能逻辑。
-5. `ros2 topic hz /rc_ctrl/button` 和对应臂的 `target` 话题应接近 125 Hz。
-6. 有 `gripped` 后仍不动，检查 `servo_p failed`、碰撞、`ERR_NOT_ENABLED`、
+3. 启动、失联或超期后先松开 Grip，再检查 `reason=fresh_grip_reference`；同时核查新源帧与 tracking 话题。
+4. 若日志包含 `latched fault`，保持故障，按下文独立流程由现场人员恢复；普通 Grip 不清错或使能。
+5. Joy 发布约 125 Hz，target 取决于新源帧；核查 bridge 的 `source_hz` 和 `pose_hz`。
+6. 已处于 `tracking` 后仍不动，检查 CSV 中的原始 servo 返回码、碰撞、`ERR_NOT_ENABLED`、
    `enable_y_limit` 和 JAKA 安全停止状态。
 
 日志中的 `sequence size exceeds remaining buffer` 来自 JAKA SDK 内部的协议调试输出，
 在没有 `servo_p failed` 时不是本工程的 JSON/文本解析错误，也不是机械臂不动的直接原因。
 
 若原始 `grip` 变化但话题没有变化，检查 APK 的 Send 和 PC-service；若 `/rc_ctrl/button`
-变化且有 `gripped`，但姿态话题没有数据，检查 Controller Tracking；若二者都正常但仍
+变化且有 `fresh_grip_reference`，但姿态话题没有数据，检查 Controller Tracking；若二者都正常但仍
 不动，检查 JAKA 登录、上电、使能、伺服模式和安全停止状态。
 
 **夹爪不动**
 
 确认 `gripper_rs485_channel` 与实际 TIO 接线一致（默认 `1` = RS485L/TIO 通道 2），
 确认 PGI 站号和波特率，并检查 JAKA App 中的 TIO 配置。
+
+## 伺服连续性修复（2026-10-28）
+
+### 实际链路、状态与提交语义
+
+实际入口是 `demo/run_teleop.zsh` → `dual_arm_teleop.launch.py` →
+`xrt_teleop_bridge` 和两个独立 `rc_ctrl_node` 进程。bridge 经 `xrt_adapter` 完成坐标映射、
+四元数和平滑，发布 PoseStamped、Joy 及新增 `/rc_ctrl/left_tracking`、
+`/rc_ctrl/right_tracking` Bool。原 IP、Pose/Joy 话题、Grip/Trigger 轴与数字按钮索引保留。
+`XRoboToolkit-Teleop-Sample-Python/` 仅作参考，运行时不切换到它。
+
+每臂只有一个 SDK 所有者线程，执行登录、启动配置、反馈查询、servo、夹爪和退出；
+ROS 回调只更新最新输入邮箱，短暂松手/跟踪丢失另有粘性中断标记，避免在阻塞调用期间丢失。
+失联时 bridge 合成的 Grip=0 不算人工松手：释放确认及夹爪执行要求 tracking 有效、Pose/Joy
+新鲜且具有同一个源帧的 ROS stamp。恢复时仍握持不会自动重新接合；自定义发布者也须遵循同帧 stamp 约定。
+运动与保持共用唯一 `servo_p(INCR, step_num)` 调用位置。周期使用单调时钟，从发送决策时刻计算
+下一截止时刻；SDK 若已阻塞到截止时刻，不再附加一个完整周期。没有集中补发循环。
+本地 SDK 没有明确保证 servo_p 是否阻塞，记录实际调用耗时及开始间隔，不把返回成功等同于到位。
+
+| 状态 | 含义与转换 |
+| --- | --- |
+| `Hold` / 0 | 新零增量保持；新鲜 Grip 按下、位姿及反馈有效时建立新参考并进入 Tracking |
+| `Tracking` / 1 | 输入映射为目标，规划受限增量；成功提交后才推进命令参考 |
+| `AwaitRelease` / 2 | 启动、输入失联、跟踪丢失、反馈过期、发送间隔超期或维护后等待新的松手帧；持续握持不能重新接合 |
+| `Fault` / 3 | SDK 失败、保护停机、反馈调用或 servo 调用超时等锁存；保存首次错误码、单调时刻、上下文；停止目标和发送 |
+
+最新手柄输入、映射目标、候选轨迹、成功提交状态和机器人反馈分别保存。
+平移以“接合时机器人位置 + 手柄相对位移”生成绝对目标，限幅后只按成功提交的增量推进，
+消除旧 `ctrl_prev=完整手柄位置` 导致的未发送位移丢失。独立平移死区冻结目标更新，旋转输入
+不会让亚毫米平移噪声穿透。已接受的目标残差可在保持同一输入时逐步完成；释放/失联立即清除残差。
+软件速度、加速度约束应用于 Tracking 中的轨迹；释放、失联、硬边界和故障停止优先于该约束，
+实际减速需核查控制器滤波和 servo 退出。重新接合使用有效反馈，不把命令提交当作机器人实际位置。
+
+Y 边界在与反馈/INCR 平移相同的假定参考系内同时限制目标和候选发送位置，左臂不低于
+−110 mm，右臂不高于 +110 mm；接合时若已经超界，只禁止继续向外，不生成突然回拉。
+这是两臂各自坐标中的单轴约束，不是经证明的整机防碰撞空间。
+不写入用户坐标系、TCP、安装姿态、负载和碰撞等级，保留现场标定与碰撞配置。
+
+普通 Grip 不再调用 collision_recover、clear_error、power_on 或 enable_robot。
+启动仍可按原流程上电/使能，但先检查控制器错误和保护状态；已就绪时跳过重复上电。
+恢复流程：现场确认停止原因并消除风险 → 在控制器独立恢复/清错/检查上电使能与标定 →
+停止并重启对应节点 → 检查启动返回码与新鲜数据 → 新松手帧后重新握持。
+节点不提供隐式自动恢复。退出不再自动打开可能夹有负载的夹爪。
+
+### 参数与配置入口
+
+新增 `control_config` launch 参数默认读取 `jaka_driver/config/teleop_control.yaml`，两臂共享
+限制配置。用 `control_config:=/绝对路径/本次配置.yaml` 指定经现场审核的配置副本。
+原姿态、Grip 滞回和 enable_y_limit launch 参数继续生效，并优先于 YAML 中同名项。
+为避免误解，默认 YAML 不重复声明这些原 launch 参数。左右臂可通过分别启动 RC 节点配置不同限制。
+
+| 参数 | 默认值 / 单位 | 依据与范围 |
+| --- | --- | --- |
+| `servo_step_num` | 1；8 ms | 附带头文件约定 step_num×8 ms；1..10，须同时满足 watchdog ≥ 周期 |
+| `max_servo_interval_s` | 0.032 s | 4 个默认周期；调度间隔超期清残差等待松手；单次 servo/反馈调用超期锁存故障 |
+| `translation_speed_mm_s` | 125 mm/s，每轴 | 采用旧注释的预期速度；旧 5 mm/8 ms 实为 625 mm/s，已移除该常量 |
+| `translation_accel_mm_s2` | 500 mm/s²，每轴 | 0→125 mm/s 约 0.25 s 的初始调试值，非 S5 认证安全上限 |
+| `translation_deadband_mm` | 0.5 mm | 保留旧平移噪声量级，冻结目标而不停止发送 |
+| `rotation_speed_rad_s` | 0.1875 rad/s | 对应原 0.0015 rad/8 ms，约 10.7°/s |
+| `rotation_accel_rad_s2` | 0.75 rad/s² | 约 0.25 s 加速到默认角速度的初始调试值 |
+| `rotation_max_step_rad` | 0.0015 rad/次 | 保留原步长上限，另取角速度×周期的较小值 |
+| `rotation_deadband_rad` | 0.005 rad | 保留约 0.29° 死区；与平移噪声独立 |
+| `rotation_scale/gain/sign` | 0.5 / 0.5 / +1 | gain 以 8 ms 为基准按时间换算；sign 作用于目标旋转，不反复反号误差 |
+| `grip_press/release_threshold` | 0.6 / 0.4 | 保留滞回；实际比较为 >，释放条件为 ≤ release |
+| `input_timeout_s` / `max_source_age_s` | 0.2 / 0.2 s | 接收单调年龄及 ROS stamp 年龄分别检查；跨机 ROS 时钟需同步，stamp 未来容差 50 ms |
+| `require_tracking` | true | 要求新增 tracking 心跳有效；旧发布者需适配，显式 false 会降低检测能力 |
+| `feedback_period_s` / `feedback_timeout_s` | 0.1 / 0.3 s | SDK 状态缓存设置 100 ms；反馈年龄为查询接收年龄，无硬件采样时刻保证 |
+| `y_limit_mm` / `enable_y_limit` | 110 mm / true | 保留现场原单轴边界，参考系仍待确认 |
+| `gripper_call_timeout_s` | 0.25 s | 退出 servo 后同步 IO 的返回耗时门限；超时锁存，不恢复 servo；不是可取消的 SDK 超时 |
+| `diagnostic_dir` | `log/teleop` | run_teleop 先切到 demo；直接 ros2 启动也应从 demo 执行或指定 demo 内绝对路径 |
+| bridge `source_timeout_s` | 0.2 s | 根据 SDK 时间戳是否推进判断，不以位姿变化判断 |
+| bridge `require_source_timestamp` | true | 缺少 get_time_stamp_ns 时停止位姿发布；显式 false 仅接收新鲜度回退，并打印能力不足 |
+
+`servo_filter` 是单选：`carte_nlf`（默认）、`none`、`speed_foresight`。默认 NLF 参数保留现场
+原值：平移 1500 mm/s、2500 mm/s²、2800 mm/s³；旋转 1120 °/s、1180 °/s²、1720 °/s³，
+分别配置于 `nlf_translation_{speed_mm_s,accel_mm_s2,jerk_mm_s3}` 与
+`nlf_rotation_{speed_deg_s,accel_deg_s2,jerk_deg_s3}`。这些原 NLF 值高于本轮软件限值，
+本轮未声称已优化滤波或可据此防止关节超限。foresight 备选为 buffer=10、kp=0.5。
+启动记录所选模式、所有参数和原始返回码，失败日志对应实际配置接口。没有同时启用多个滤波模式。
+
+### 夹爪调度与诊断
+
+PGI 线性/数字映射、地址和寄存器功能保留；握持时只合并最新 Trigger，松开且位姿、跟踪、
+Joy 新鲜后执行。退出 servo 成功 → 同步 TIO 写入 → 未失败/未超时才重新进入零保持。
+失联产生的中性 Grip 不触发夹爪待执行目标。维护期间的新输入在操作返回后重新读取，
+不恢复旧手柄参考；重新接合仍需要新的释放/握持过程。未假定 SDK 支持同进程第二连接或并发 TIO。
+SDK 没有 TIO 取消接口，若某个调用永不返回，应用不能抢占该调用或保证关机时限，需控制器侧保护。
+
+每臂 CSV 文件放在 `demo/log/teleop/`，文件名含启动标识。
+4096 条缓冲、每秒在 ROS 线程写盘，溢出丢最旧记录并累计 dropped_records，SDK 线程不写盘。
+记录输入源的桥接 ROS stamp、接收单调时刻、Grip/跟踪、手柄位姿、映射位移、目标、
+限幅前残差、实际发送增量、规划/提交位置、目标/提交姿态、六关节反馈、反馈接收时刻、
+servo 起止/间隔/原始返回码、夹爪总调用耗时、状态和首个故障码/时刻/上下文。
+启动日志另记 SDK 版本、用户坐标系及定义、TCP 及定义、安装姿态、负载、碰撞等级与读取返回码。
+反馈使用附带 SDK 的 RobotStatus 缓存；该接口已在头文件标为 deprecated，OptionalInfoConfig
+可能影响字段，采样时间及更新序号不可用。必须与控制器记录对齐后才分析真实跟随误差。
+bridge 每 5 秒分别记录 poll_hz/source_hz/pose_hz，servo 频率从 CSV 的实际开始间隔计算，
+反馈频率从 feedback 行计算，三者不可互相替代。
+
+### 纯离线验证与环境范围
+
+从仓库根目录执行（Windows Python 3.10、UCRT64 GCC 15.2.0；无需加载机器人库）：
+
+```powershell
+python demo/test/run_offline_tests.py --cxx C:/msys64/ucrt64/bin/g++.exe
+```
+
+Linux 主机装好 pytest/C++17 编译器后也可执行：
+
+```sh
+python3 demo/test/run_offline_tests.py --cxx g++
+```
+
+runner 将 GCC 动态库搜索路径限制在其子进程中，修复本机错误加载其他 winpthread 导致的
+cc1plus/clock_gettime64 弹窗；不修改系统 PATH。产物、测试缓存和假节点 CSV 均在 demo/build/offline。
+编译使用 `-std=c++17 -Wall -Wextra -Wpedantic -Werror -UNDEBUG`，测试断言不会被 Release 配置移除。
+包含：orientation_math、PGI 协议、纯控制逻辑（9 组）及包含实际 rc_ctrl_node.cpp、真实 PGI
+实现、离线 ROS 邮箱和 fake SDK 定义的集成测试。生产 CMake 不引用 fake/shim。
+后者验证 SDK 单一线程、零保持、残差释放、夹爪退出/恢复顺序、长 IO、发送失败、保护错误
+0x128000、反复 Grip 不恢复、SDK 延迟与部分启动失败退出。它不链接 libjakaAPI.so，不发网络数据。
+另跑 xrt_teleop 20 项和 sr_amr_control 24 项测试，全部通过，检查 launch/bridge Python 语法。
+运行记录以 `demo/build/offline/results.txt` 为准。
+
+纯逻辑断言覆盖静止/死区每周期零保持、不重放非零指令、[0,20,20,15,10,5,0] mm 返回原点、
+速度/加速度与提交事务、平移/姿态大残差松手重建、输入/反馈过期、SDK 延迟失败、q/-q、
+非零初始姿态、正反旋转方向、左右 Y 边界/超界接合/提交失败、16 ms 周期和无效参数。
+独立数学修复包括 sign=-1 反复反号误差导致方向发散，以及精确 π 时 q=(0,0,0,1) 与 -q
+因有符号零选择相反插值轴；现在用确定性轴符号消除后者。
+
+#### 独立姿态边界复现：相对握持原点跨越 π
+
+保留的“相对 Grip 原点旋转取最短弧，再乘 rotation_scale”映射仍有独立数学限制：
+初始手柄姿态为单位旋转，scale=0.5，手柄相对 yaw 从 +179° 到 +181° 时，
+目标 yaw 从 +89.5° 变为 −89.5°，形成约 179° 的目标跳变。新增离线断言明确复现此现象，
+并确认实际发送角步长仍受限；速度/加速度规划并不能消除目标方向反转。
+这不同于手柄初始 yaw≈π 时跨越欧拉 ±π 的小幅转动，也不等同于 q/−q 等价表示问题。
+本轮未重新定义该相对旋转缩放语义；需后续评估连续姿态路径展开或明确的接合工作角范围，
+并在厂商确认 INCR 姿态契约后验证。现场初次验证应避开相对握持原点的 π 边界，必要时松手重建参考。
+
+本机缺 ROS 2/ament/colcon，附带库为 Linux AArch64 .so，不能在 Windows 完成真实链接。
+ROS shim 检查生产源与真实 SDK 声明的 C++ 兼容性，不代表真实 ROS 构建/运行验证。
+现有 launch 测试需要 XRT_VENV，runner 仅为声明检查创建不执行的 bin/python 文件标记。
+集成测试把发送 watchdog 放宽到 120 ms、夹爪门限降至 30 ms，以隔离 Windows 调度噪声；
+默认 32 ms 的具体超时语义由可控模拟时间测试覆盖，不声称 Windows 达到实机实时性。
+目标 Linux/ARM 主机需另行运行 `./build.zsh`、`colcon test --packages-select jaka_driver xrt_teleop sr_amr_control`
+和 `colcon test-result --verbose`，之后才做设备验证。
+
+### SDK、标定与现场待确认项
+
+参考 [JAKA C++ 文档](https://www.jaka.com/docs/legacy172/guide/1.7.2/SDK/Cpp.html)、
+[Servo 滤波说明](https://www.jaka.com/docs/legacy172/guide/1.7.2/SDK/Filter%20setting.html)、
+[报警查询](https://www.jaka.com/zh/commonQuestion) 及
+[XRoboToolkit Python binding](https://github.com/XR-Robotics/XRoboToolkit-PC-Service-Pybind)。
+在线 legacy172 页中的扩展参数比附带头文件多，不可据网页假定本地二进制支持队列长度、
+异步控制或新的滤波姿态参数。本轮以附带声明编译；实机 SDK/控制器版本需启动日志和厂商比对。
+报警页本次工具读取因页面过大失败，未据此重新解释报警。
+
+附带头文件仅规定周期和 INCR 模式，未完整定义 servo_p 的 RPY 叠加方式、旋转组合方向、
+增量平移参考系与当前用户坐标的关系。实现明确使用 Rz Ry Rx、参考系左乘的小旋转假设，
+与既有四元数链保持一致；用非零 TCP 初始姿态、分别绕三个轴的微小正反旋转，在官方仿真或
+厂商示例中区分左乘/右乘与 RPY 分量相加，再确认本实现。未经确认不能把离线数学自洽当作 SDK 契约。
+
+左臂 USRFRM15、右臂“世界坐标系 + TCP15”需分别读取比对；bridge 的 world frame_id 是元数据，
+共用映射不会自动应用或验证两臂用户坐标标定。本轮不改标定，Y 边界同参考系假设也需现场核验。
+上游 get_time_stamp_ns 在本地参考代码与官方 binding 文档中存在，但未获得所装二进制实现，
+必须确认它随实际设备新帧推进且断连后停止。getter 之间没有已确认的原子快照保证；没有确认
+每个手柄独立的跟踪/连接标志，因此全局源仍推进而单侧缓存冻结的情况尚不能完全检测。
+
+J5≈−180°及提供的右臂角度只作为诊断线索。本轮未以任意阈值判断 S5 奇异，也未实施完整 IK
+或 servo_j 迁移。必须使用准确 S5 模型、关节零位和六关节时序反馈，区分近奇异、目标不连续、
+伺服延迟与控制器跟随误差，才能归因腕部上下晃动及 0x128000 的实际触发顺序。
+
+现场验证按以下顺序分项记录，由现场人员另行执行：
+
+1. 脱离设备先完成目标主机真实构建/离线测试，核对 SDK 与控制器版本、CSV 输出和现有标定备份。
+2. 保持原碰撞保护，分别读取左右用户坐标/TCP、侧装姿态与负载；核查共用映射和 Y 方向/边界。
+3. 用 input_probe/bridge 日志验证静止新帧、停 Send、断连、单侧遮挡与恢复；确认时间戳语义。
+4. 单臂空载低速，先位置控制，核查静止零流、慢动、往返原点、较大残差松手及重新握持无追赶。
+5. 测试 Trigger 排队、松手夹爪动作和重新接合；核对 SDK 阻塞耗时、退出/恢复和输入新鲜度。
+6. 在官方仿真或厂商确认姿态语义后，非零初始姿态下逐轴微小正反旋转，再测试 q/-q 与姿态边界。
+7. 现场按正式流程验证输入丢失、延迟和保护停机；故障持续握持不能恢复，独立恢复后重启验证。
+8. 单臂通过后再验证双臂；由厂商/现场人员规划接近可疑姿态的专项试验，同步保存控制器原始报警、
+   六关节反馈与主机 CSV。用记录补充晃动改善结论，不能以本次离线通过代替实机结果。
