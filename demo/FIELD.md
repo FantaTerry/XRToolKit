@@ -5,7 +5,22 @@
 
 ---
 
-## Step 1 · 切到一个确定的代码版本（不动你的 `canghao`）
+## 正在跑旧参数的话，先做这四条（不用重编译，立即生效）
+
+上一轮"死区 + 猛跳"是我加的跟随闸门造成的，先关掉它、打开奇异点降速：
+
+```zsh
+ros2 param set /rc_ctrl_left  servo_max_track_error_mm 0.0
+ros2 param set /rc_ctrl_right servo_max_track_error_mm 0.0
+ros2 param set /rc_ctrl_left  servo_singularity_slowdown true
+ros2 param set /rc_ctrl_right servo_singularity_slowdown true
+```
+
+然后再测一轮，行为和"原始版本"应该基本一致，只是腕部附近会变慢。
+
+---
+
+## Step 1 · 切到一个确定的代码版本（不动你的 `canghao` 分支）
 
 ```zsh
 cd ~/Documents/dj_main/XRToolKit
@@ -71,8 +86,8 @@ grep -E 'feedback calibration|feedback source|governors:|black box|joints\(rad\)
 
 ```
 [right] feedback calibration: actual_tcp=..us(ok=0/1) actual_joints=..us(ok=0/1) robot_status=..us(ok=0/1) simple=..us
-[right] feedback source=robot_status every N cycle(s) (.. us/cycle), gate=on, alarm log=on every M cycle(s)
-[right] governors: ... timer_driven=off min_period=8.5ms blackbox=on
+[right] feedback source=actual_* every N cycle(s) (.. us/cycle), gate=on, alarm log=on every M cycle(s)
+[right] governors: ... track_gate=0.0mm ... singularity=on(15deg,min 0.35) timer_driven=off min_period=8.5ms blackbox=on
 [right] black box: log/teleop/right_....csv
 [right] joints(rad): ... -> J5 is .. deg from the wrist singularity
 ```

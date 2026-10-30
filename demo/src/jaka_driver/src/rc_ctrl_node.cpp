@@ -119,14 +119,18 @@ bool arm_tcp_valid = false;     // whether the grip-time TCP read succeeded
 // ---------------------------------------------------------------------------
 double servo_leash_radius_mm = 600.0;
 double servo_trans_accel_mm_s2 = 1500.0;
-double servo_max_track_error_mm = 10.0;
+// Tracking gate. OFF by default and kept only as an experiment: it compares the
+// dead reckoned command point with the measured TCP, and under INCR servo the
+// command point is always ahead of the arm, so a small threshold self latches.
+// When enabled it now drops the pending motion instead of dumping it on release.
+double servo_max_track_error_mm = 0.0;
 double servo_track_deadman_s = 2.0;
 double servo_feedback_budget_us = 200.0;   // average us per 8 ms cycle
 bool servo_feedback_enabled = true;
 // Optional wrist-singularity slow down. The wrist is singular when J5 is 0 or
 // +-180 deg, and there the same Cartesian step asks for a much larger joint
 // step. Disabled by default: it is a mitigation, not a diagnosis.
-bool servo_singularity_slowdown = false;
+bool servo_singularity_slowdown = true;
 double servo_singularity_threshold_deg = 15.0;
 double servo_singularity_min_scale = 0.35;
 bool actual_joints_valid = false;
@@ -754,6 +758,10 @@ void servo_cartesian(JAKAZuRobot &robot,
     if (held)
     {
         servo_hold(robot);
+        // Drop the pending motion instead of keeping it. Otherwise the moment
+        // the gate releases, the whole accumulated offset is commanded at once
+        // and the arm lurches out of the hold.
+        ctrl_prev = ctrl_now;
         blackbox_line("servo", "track_hold", incr, off_x, off_y, off_z,
                       cmd_x, cmd_y, cmd_z, 0, true);
         static int hold_count = 0;
@@ -1355,7 +1363,7 @@ int main(int argc, char *argv[])
    servo_trans_accel_mm_s2 = node->declare_parameter<double>(
        "servo_trans_accel_mm_s2", 1500.0);
    servo_max_track_error_mm = node->declare_parameter<double>(
-       "servo_max_track_error_mm", 10.0);
+       "servo_max_track_error_mm", 0.0);
    servo_track_deadman_s = node->declare_parameter<double>(
        "servo_track_deadman_s", 2.0);
    servo_feedback_enabled = node->declare_parameter<bool>(
@@ -1363,7 +1371,7 @@ int main(int argc, char *argv[])
    servo_feedback_budget_us = node->declare_parameter<double>(
        "servo_feedback_budget_us", 200.0);
    servo_singularity_slowdown = node->declare_parameter<bool>(
-       "servo_singularity_slowdown", false);
+       "servo_singularity_slowdown", true);
    servo_singularity_threshold_deg = node->declare_parameter<double>(
        "servo_singularity_threshold_deg", 15.0);
    servo_singularity_min_scale = node->declare_parameter<double>(
@@ -1379,7 +1387,7 @@ int main(int argc, char *argv[])
    if (!std::isfinite(servo_trans_accel_mm_s2) || servo_trans_accel_mm_s2 < 0.0)
        servo_trans_accel_mm_s2 = 1500.0;
    if (!std::isfinite(servo_max_track_error_mm) || servo_max_track_error_mm < 0.0)
-       servo_max_track_error_mm = 10.0;
+       servo_max_track_error_mm = 0.0;
    if (!std::isfinite(servo_track_deadman_s) || servo_track_deadman_s < 0.0)
        servo_track_deadman_s = 2.0;
    if (!std::isfinite(servo_feedback_budget_us) || servo_feedback_budget_us < 50.0)

@@ -208,16 +208,33 @@ def analyse(path):
         lines.append("  STALL   none")
 
     # 5. joint rate ---------------------------------------------------------
+    # The joint columns only change when a feedback sample lands, which can be
+    # far slower than the servo rate, so divide by the time since that joint
+    # last changed instead of by the servo interval.
     names = ["j1", "j2", "j3", "j4", "j5", "j6"]
     worst = {name: (0.0, 0.0) for name in names}
+    last_time = {name: servo[0]["t"] for name in names} if servo else {}
+    last_value = {name: servo[0][name] for name in names} if servo else {}
+    change_interval = []
     for i in range(1, len(servo)):
-        dt = servo[i]["t"] - servo[i - 1]["t"]
-        if dt <= 1e-6:
-            continue
+        t = servo[i]["t"]
         for name in names:
-            rate = abs(servo[i][name] - servo[i - 1][name]) / dt * 180.0 / 3.141592653589793
-            if rate > worst[name][0]:
-                worst[name] = (rate, servo[i]["t"])
+            value = servo[i][name]
+            if value == last_value[name]:
+                continue
+            span = t - last_time[name]
+            if span > 1e-6:
+                rate = abs(value - last_value[name]) / span * 180.0 / 3.141592653589793
+                if rate > worst[name][0]:
+                    worst[name] = (rate, t)
+                if name == "j1":
+                    change_interval.append(span)
+            last_value[name] = value
+            last_time[name] = t
+    if change_interval:
+        change_interval.sort()
+        lines.append("  FB      joint feedback updates every %.0f ms (median)"
+                     % (change_interval[len(change_interval) // 2] * 1000.0))
     if servo:
         parts = []
         for name in names:
