@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <thread>
 
 #include "jaka_driver/jkerr.h"
@@ -38,15 +37,10 @@ bool Pgi140Gripper::fail(const std::string & message, std::string * error) const
 
 bool Pgi140Gripper::write_register(uint16_t address, uint16_t value, std::string * error)
 {
-  if (command_guard_ && !command_guard_()) {
-    last_sdk_return_ = 0; // no SDK call; distinguish input cancellation from raw SDK failure
-    return fail("input authorization expired before register write", error);
-  }
   auto frame = make_write_single_register(
     static_cast<uint8_t>(config_.slave_id), address, value);
   const int ret = robot_.send_tio_rs_command(
     config_.rs485_channel, frame.data(), static_cast<int>(frame.size()));
-  last_sdk_return_ = ret;
   if (ret != ERR_SUCC) {
     return fail(
       "send_tio_rs_command failed, return code " + std::to_string(ret), error);
@@ -56,8 +50,6 @@ bool Pgi140Gripper::write_register(uint16_t address, uint16_t value, std::string
 
 bool Pgi140Gripper::initialize(std::string * error)
 {
-  configured_ = false;
-  force_configured_ = speed_configured_ = has_position_command_ = false;
   if (!valid_channel(config_.rs485_channel)) {
     return fail("rs485_channel must be 0 (RS485H) or 1 (RS485L)", error);
   }
@@ -79,9 +71,6 @@ bool Pgi140Gripper::initialize(std::string * error)
   }
   if (config_.initialize_command != 0x01 && config_.initialize_command != 0xA5) {
     return fail("initialize_command must be 0x01 or 0xA5", error);
-  }
-  if (config_.initialize_delay_ms < 0) {
-    return fail("initialize_delay_ms must be nonnegative", error);
   }
   if (config_.enable_tio_power && (config_.tio_voltage < 0 || config_.tio_voltage > 1)) {
     return fail("tio_voltage must be 0 (24 V) or 1 (12 V)", error);
@@ -135,16 +124,14 @@ bool Pgi140Gripper::initialize(std::string * error)
     }
   }
 
-  if (config_.configure_motion_parameters &&
-    (!set_force(config_.force_percent, error) || !set_speed(config_.speed_percent, error)))
+  if (!set_force(config_.force_percent, error) ||
+    !set_speed(config_.speed_percent, error) ||
+    !set_position(config_.open_position, error))
   {
     configured_ = false;
     return false;
   }
-  if (config_.startup_open && !set_position(config_.open_position, error)) {
-    configured_ = false;
-    return false;
-  }
+  closed_ = false;
   return true;
 }
 
@@ -156,19 +143,7 @@ bool Pgi140Gripper::set_position(int position, std::string * error)
   if (!is_valid_position(position)) {
     return fail("position must be in the PGI range 0..1000", error);
   }
-  // Preserve force/speed at restart. Apply configured settings lazily only
-  // when an explicit position command is actually requested by the operator.
-  if ((!force_configured_ && !set_force(config_.force_percent, error)) ||
-    (!speed_configured_ && !set_speed(config_.speed_percent, error)))
-  {
-    return false;
-  }
-  if (!write_register(kPositionRegister, static_cast<uint16_t>(position), error)) {
-    return false;
-  }
-  has_position_command_ = true;
-  closed_ = position == config_.closed_position;
-  return true;
+  return write_register(kPositionRegister, static_cast<uint16_t>(position), error);
 }
 
 bool Pgi140Gripper::set_force(int force_percent, std::string * error)
@@ -179,12 +154,7 @@ bool Pgi140Gripper::set_force(int force_percent, std::string * error)
   if (!is_valid_force(force_percent)) {
     return fail("force must be in the PGI range 20..100", error);
   }
-  if (!write_register(kForceRegister, static_cast<uint16_t>(force_percent), error)) {
-    return false;
-  }
-  force_configured_ = true;
-  config_.force_percent = force_percent;
-  return true;
+  return write_register(kForceRegister, static_cast<uint16_t>(force_percent), error);
 }
 
 bool Pgi140Gripper::set_speed(int speed_percent, std::string * error)
@@ -195,12 +165,7 @@ bool Pgi140Gripper::set_speed(int speed_percent, std::string * error)
   if (!is_valid_speed(speed_percent)) {
     return fail("speed must be in the PGI range 1..100", error);
   }
-  if (!write_register(kSpeedRegister, static_cast<uint16_t>(speed_percent), error)) {
-    return false;
-  }
-  speed_configured_ = true;
-  config_.speed_percent = speed_percent;
-  return true;
+  return write_register(kSpeedRegister, static_cast<uint16_t>(speed_percent), error);
 }
 
 bool Pgi140Gripper::set_closed(bool closed, std::string * error)
@@ -214,7 +179,7 @@ bool Pgi140Gripper::set_closed(bool closed, std::string * error)
 
 bool Pgi140Gripper::Grip(float grip, std::string * error)
 {
-  if (!std::isfinite(grip) || grip < 0.0f || grip > 1.0f) {
+  if (grip < 0.0f || grip > 1.0f) {
     return fail("grip must be in the range [0.0, 1.0]", error);
   }
   const int position = static_cast<int>(

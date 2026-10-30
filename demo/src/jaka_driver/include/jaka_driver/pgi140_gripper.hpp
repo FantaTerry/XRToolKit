@@ -2,7 +2,6 @@
 #define JAKA_DRIVER_PGI140_GRIPPER_HPP_
 
 #include <cstdint>
-#include <functional>
 #include <string>
 
 #include "jaka_driver/JAKAZuRobot.h"
@@ -22,11 +21,7 @@ struct GripperConfig
   int speed_percent = 100;      // PGI range: 1..100
   int open_position = 0;       // PGI range: 0..1000 per mille
   int closed_position = 1000;  // PGI range: 0..1000 per mille
-  // Safe restart policy: configure communication without issuing calibration,
-  // force/speed or position writes unless the operator explicitly opts in.
-  bool initialize = false;
-  bool configure_motion_parameters = false;
-  bool startup_open = false;
+  bool initialize = true;
   int initialize_command = 0x01;
   int initialize_delay_ms = 2000;
   bool configure_tio = true;   // false: use the TIO configuration saved in JAKA App
@@ -39,8 +34,7 @@ class Pgi140Gripper
 public:
   Pgi140Gripper(JAKAZuRobot & robot, GripperConfig config);
 
-  // Configure communication. Calibration, motion-parameter writes and active
-  // opening are independent explicit startup choices in GripperConfig.
+  // Configure the selected TIO RS485 channel and optionally initialize the gripper.
   bool initialize(std::string * error = nullptr);
 
   // Send a target position. The value is validated before any frame is sent.
@@ -50,14 +44,7 @@ public:
   bool set_closed(bool closed, std::string * error = nullptr);
   bool Grip(float grip, std::string * error = nullptr);
 
-  // These describe successful command submission, never physical readback.
-  // With the default preserve policy no position is assumed after restart.
-  bool has_position_command() const { return has_position_command_; }
   bool closed() const { return closed_; }
-  int last_sdk_return() const { return last_sdk_return_; }
-  // Owner-supplied authorization checked before EACH synchronous register write.
-  // It cannot cancel a call already inside the SDK.
-  void set_command_guard(std::function<bool()> guard) { command_guard_ = std::move(guard); }
   const GripperConfig & config() const { return config_; }
 
 private:
@@ -67,12 +54,7 @@ private:
   JAKAZuRobot & robot_;
   GripperConfig config_;
   bool configured_ = false;
-  bool force_configured_ = false;
-  bool speed_configured_ = false;
-  bool has_position_command_ = false;
   bool closed_ = false;
-  int last_sdk_return_ = 0; // raw result of the most recent synchronous TIO write
-  std::function<bool()> command_guard_;
 };
 
 }  // namespace pgi140

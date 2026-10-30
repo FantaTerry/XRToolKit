@@ -1,17 +1,11 @@
 import launch
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
-from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
-    control_config_arg = DeclareLaunchArgument(
-        'control_config',
-        default_value=PathJoinSubstitution([FindPackageShare('jaka_driver'), 'config', 'teleop_control.yaml']),
-        description='Servo timing, trajectory limits, freshness, filter and diagnostics YAML')
-    debug_arg = DeclareLaunchArgument('debug', default_value='false')
     # Declare launch arguments
     robot_left_ip_arg = DeclareLaunchArgument(
         'robot_left_ip',
@@ -71,10 +65,8 @@ def generate_launch_description():
         'gripper_trigger_deadband', default_value='0.02',
         description='Minimal change in analog trigger to send a new Grip()')
     gripper_initialize_arg = DeclareLaunchArgument(
-        'gripper_initialize', default_value='false',
+        'gripper_initialize', default_value='true',
         description='Initialize PGI gripper during node startup')
-    gripper_startup_open_arg = DeclareLaunchArgument('gripper_startup_open', default_value='false', description='Explicitly open on startup; false preserves held load')
-    gripper_motion_parameters_arg = DeclareLaunchArgument('gripper_configure_motion_parameters', default_value='false', description='Explicit startup force/speed writes')
     gripper_initialize_command_arg = DeclareLaunchArgument(
         'gripper_initialize_command', default_value='1',
         description='PGI initialization command: 1 or 165 (0xA5)')
@@ -134,9 +126,8 @@ def generate_launch_description():
         name='rc_ctrl_left',
         output='screen',
         condition=launch.conditions.IfCondition(LaunchConfiguration('rc_ctrl')),
-        parameters=[LaunchConfiguration('control_config'), {
+        parameters=[{
             'arm_name': 'left',
-            'debug': ParameterValue(LaunchConfiguration('debug'), value_type=bool),
             'robot_ip': LaunchConfiguration('robot_left_ip'),
             'target_topic': LaunchConfiguration('left_target_topic'),
             'button_topic': LaunchConfiguration('button_topic'),
@@ -152,8 +143,6 @@ def generate_launch_description():
             'gripper_linear': ParameterValue(LaunchConfiguration('gripper_linear'), value_type=bool),
             'gripper_trigger_deadband': ParameterValue(LaunchConfiguration('gripper_trigger_deadband'), value_type=float),
             'gripper_initialize': ParameterValue(LaunchConfiguration('gripper_initialize'), value_type=bool),
-            'gripper_startup_open': ParameterValue(LaunchConfiguration('gripper_startup_open'), value_type=bool),
-            'gripper_configure_motion_parameters': ParameterValue(LaunchConfiguration('gripper_configure_motion_parameters'), value_type=bool),
             'gripper_initialize_command': ParameterValue(LaunchConfiguration('gripper_initialize_command'), value_type=int),
             'gripper_initialize_delay_ms': ParameterValue(LaunchConfiguration('gripper_initialize_delay_ms'), value_type=int),
             'gripper_configure_tio': ParameterValue(LaunchConfiguration('gripper_configure_tio'), value_type=bool),
@@ -178,9 +167,8 @@ def generate_launch_description():
         name='rc_ctrl_right',
         output='screen',
         condition=launch.conditions.IfCondition(LaunchConfiguration('rc_ctrl')),
-        parameters=[LaunchConfiguration('control_config'), {
+        parameters=[{
             'arm_name': 'right',
-            'debug': ParameterValue(LaunchConfiguration('debug'), value_type=bool),
             'robot_ip': LaunchConfiguration('robot_right_ip'),
             'target_topic': LaunchConfiguration('right_target_topic'),
             'button_topic': LaunchConfiguration('button_topic'),
@@ -196,8 +184,6 @@ def generate_launch_description():
             'gripper_linear': ParameterValue(LaunchConfiguration('gripper_linear'), value_type=bool),
             'gripper_trigger_deadband': ParameterValue(LaunchConfiguration('gripper_trigger_deadband'), value_type=float),
             'gripper_initialize': ParameterValue(LaunchConfiguration('gripper_initialize'), value_type=bool),
-            'gripper_startup_open': ParameterValue(LaunchConfiguration('gripper_startup_open'), value_type=bool),
-            'gripper_configure_motion_parameters': ParameterValue(LaunchConfiguration('gripper_configure_motion_parameters'), value_type=bool),
             'gripper_initialize_command': ParameterValue(LaunchConfiguration('gripper_initialize_command'), value_type=int),
             'gripper_initialize_delay_ms': ParameterValue(LaunchConfiguration('gripper_initialize_delay_ms'), value_type=int),
             'gripper_configure_tio': ParameterValue(LaunchConfiguration('gripper_configure_tio'), value_type=bool),
@@ -218,8 +204,6 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        control_config_arg,
-        debug_arg,
         robot_left_ip_arg,
         robot_right_ip_arg,
         rc_ctrl_arg,
@@ -236,8 +220,6 @@ def generate_launch_description():
         gripper_linear_arg,
         gripper_trigger_deadband_arg,
         gripper_initialize_arg,
-        gripper_startup_open_arg,
-        gripper_motion_parameters_arg,
         gripper_initialize_command_arg,
         gripper_initialize_delay_arg,
         gripper_configure_tio_arg,

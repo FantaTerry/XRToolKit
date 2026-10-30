@@ -3,28 +3,13 @@ xrt_teleop_bridge:
     left_target_topic: /rc_ctrl/left_target
     right_target_topic: /rc_ctrl/right_target
     button_topic: /rc_ctrl/button
-    left_tracking_topic: /rc_ctrl/left_tracking
-    right_tracking_topic: /rc_ctrl/right_tracking
-    # Authoritative recovery generation: +first recovered ROS stamp_ns;
-    # -first observed loss ROS stamp_ns. Repeated unchanged within a generation.
-    # Bool tracking remains diagnostic; source ROS time must advance across epochs.
-    left_input_state_topic: /rc_ctrl/left_input_state
-    right_input_state_topic: /rc_ctrl/right_input_state
     publish_rate: 125.0
-    # get_time_stamp_ns progress, measured with monotonic local time. Stationary
-    # controller poses remain valid while source timestamps advance.
-    source_timeout_s: 0.2
-    # false explicitly permits receipt-only fallback for older Python bindings.
-    # That fallback cannot detect a disconnected SDK returning cached poses.
-    require_source_timestamp: true
     smooth_alpha: 0.4
     input_log_period: 5.0
     pose_scale: 1.0
     grip_threshold: 0.5
     enable_left: true
     enable_right: true
-    # Metadata only: this does not select/change the controller's calibrated
-    # user frame or TCP. Confirm this common mapping for both installed arms.
     robot_base_frame: world
     quest_mac: "50:99:03:0a:38:78"
 

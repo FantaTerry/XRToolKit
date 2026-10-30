@@ -70,13 +70,7 @@ inline Quaternion quat_multiply(const Quaternion & a, const Quaternion & b)
 inline Quaternion quat_canonical(const Quaternion & input)
 {
   Quaternion result = input;
-  // At an exact half-turn, both +0 and -0 scalar parts compare equal to zero.
-  // Choose the vector sign deterministically as well, so q/-q do not select
-  // opposite interpolation directions for the same physical orientation.
-  const bool negative_half_turn_axis = result.s == 0.0 &&
-    (result.x < 0.0 || (result.x == 0.0 &&
-    (result.y < 0.0 || (result.y == 0.0 && result.z < 0.0))));
-  if (result.s < 0.0 || negative_half_turn_axis) {
+  if (result.s < 0.0) {
     result.s = -result.s;
     result.x = -result.x;
     result.y = -result.y;

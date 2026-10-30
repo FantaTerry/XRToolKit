@@ -7,10 +7,6 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
-    control_config_arg = DeclareLaunchArgument(
-        'control_config',
-        default_value=PathJoinSubstitution([FindPackageShare('jaka_driver'), 'config', 'teleop_control.yaml']),
-        description='JAKA servo timing, trajectory and filter configuration')
     # Forwarded to RC_ctrl.launch.py so the arm IPs can be overridden from here,
     # e.g.  ros2 launch jaka_driver dual_arm_teleop.launch.py robot_left_ip:=192.168.71.36
     robot_left_ip_arg = DeclareLaunchArgument(
@@ -44,10 +40,8 @@ def generate_launch_description():
         'gripper_trigger_deadband', default_value='0.02',
         description='Minimal change in analog trigger to send a new Grip()')
     gripper_initialize_arg = DeclareLaunchArgument(
-        'gripper_initialize', default_value='false',
+        'gripper_initialize', default_value='true',
         description='Initialize PGI grippers during node startup')
-    gripper_startup_open_arg = DeclareLaunchArgument('gripper_startup_open', default_value='false', description='Explicitly open on startup; false preserves held load')
-    gripper_motion_parameters_arg = DeclareLaunchArgument('gripper_configure_motion_parameters', default_value='false', description='Explicit startup force/speed writes')
     gripper_initialize_command_arg = DeclareLaunchArgument(
         'gripper_initialize_command', default_value='1',
         description='PGI initialization command: 1 or 165 (0xA5)')
@@ -126,7 +120,6 @@ def generate_launch_description():
             PathJoinSubstitution([FindPackageShare('jaka_driver'), 'launch', 'RC_ctrl.launch.py'])
         ]),
         launch_arguments={
-            'control_config': LaunchConfiguration('control_config'),
             'robot_left_ip': LaunchConfiguration('robot_left_ip'),
             'robot_right_ip': LaunchConfiguration('robot_right_ip'),
             'gripper_force': LaunchConfiguration('gripper_force'),
@@ -139,8 +132,6 @@ def generate_launch_description():
             'gripper_linear': LaunchConfiguration('gripper_linear'),
             'gripper_trigger_deadband': LaunchConfiguration('gripper_trigger_deadband'),
             'gripper_initialize': LaunchConfiguration('gripper_initialize'),
-            'gripper_startup_open': LaunchConfiguration('gripper_startup_open'),
-            'gripper_configure_motion_parameters': LaunchConfiguration('gripper_configure_motion_parameters'),
             'gripper_initialize_command': LaunchConfiguration('gripper_initialize_command'),
             'gripper_initialize_delay_ms': LaunchConfiguration('gripper_initialize_delay_ms'),
             'gripper_configure_tio': LaunchConfiguration('gripper_configure_tio'),
@@ -162,7 +153,6 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        control_config_arg,
         robot_left_ip_arg,
         robot_right_ip_arg,
         gripper_force_arg,
@@ -175,8 +165,6 @@ def generate_launch_description():
         gripper_linear_arg,
         gripper_trigger_deadband_arg,
         gripper_initialize_arg,
-        gripper_startup_open_arg,
-        gripper_motion_parameters_arg,
         gripper_initialize_command_arg,
         gripper_initialize_delay_arg,
         gripper_configure_tio_arg,

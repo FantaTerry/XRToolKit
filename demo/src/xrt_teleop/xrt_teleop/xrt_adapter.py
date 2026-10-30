@@ -9,56 +9,6 @@ official XRoboToolkit teleoperation examples.
 import math
 
 
-class SourceFreshness:
-    """Track source progress without treating a stationary pose as a lost frame.
-
-    The SDK timestamp is an opaque source token, not a ROS/host clock. Only its
-    progress is used; elapsed age always uses the caller's monotonic seconds.
-    A timestamp rollback invalidates that sample and starts a new epoch.
-    """
-
-    def __init__(self, timeout_s=0.2, require_timestamp=True):
-        if not math.isfinite(timeout_s) or timeout_s <= 0.0:
-            raise ValueError("source timeout must be finite and positive")
-        self.timeout_s = float(timeout_s)
-        self.require_timestamp = bool(require_timestamp)
-        self.last_source_ns = None
-        self.last_advance_s = None
-        self.reason = "waiting for source"
-
-    def observe(self, source_ns, now_s, timestamp_available=True):
-        """Return ``(fresh, new_frame)``; never infer progress from pose values."""
-        if not timestamp_available:
-            if self.require_timestamp:
-                self.reason = "SDK source timestamp unavailable"
-                return False, False
-            self.last_advance_s = now_s
-            self.reason = "receipt-only fallback (source freshness unknown)"
-            return True, True
-        try:
-            token = int(source_ns)
-            if isinstance(source_ns, bool) or token <= 0 or token != source_ns:
-                raise ValueError("invalid timestamp")
-        except (TypeError, ValueError, OverflowError):
-            self.reason = "invalid SDK source timestamp"
-            return False, False
-        if self.last_source_ns is not None and token < self.last_source_ns:
-            self.last_source_ns = token
-            self.last_advance_s = None
-            self.reason = "SDK source timestamp rolled back"
-            return False, False
-        new_frame = token != self.last_source_ns
-        if new_frame:
-            self.last_source_ns = token
-            self.last_advance_s = now_s
-        fresh = (
-            self.last_advance_s is not None
-            and 0.0 <= now_s - self.last_advance_s <= self.timeout_s
-        )
-        self.reason = "source progressing" if fresh else "SDK source timestamp expired"
-        return fresh, new_frame
-
-
 DEFAULT_HEADSET_TO_ROBOT = (
     0.0, 0.0, -1.0,
     -1.0, 0.0, 0.0,
@@ -69,10 +19,6 @@ BUTTON_ORDER = (
     "X", "Y", "A", "B", "LThU", "RThU",
     "LJ", "RJ", "LG", "RG", "LTr", "RTr",
 )
-
-# Appended metadata never changes the legacy button/axis indices. The control
-# owner requires these explicit flags; a missing flag cannot authorize release.
-VALIDITY_BUTTON_ORDER = ("LGValid", "RGValid", "LTrValid", "RTrValid")
 
 
 def _clamp(value, low, high):
@@ -283,7 +229,7 @@ def _axis_pair(value):
 
 
 def joy_payload(left, right, grip_threshold=0.5):
-    """Keep legacy Joy axes/buttons and append read-validity at buttons[12:16]."""
+    """Create the stable Joy layout consumed by the copied JAKA and AMR nodes."""
     left_grip = _clamp(left.get("grip", 0.0), 0.0, 1.0)
     right_grip = _clamp(right.get("grip", 0.0), 0.0, 1.0)
     left_trigger = _clamp(left.get("trigger", 0.0), 0.0, 1.0)
@@ -316,7 +262,4 @@ def joy_payload(left, right, grip_threshold=0.5):
         "RTr": right_trigger > grip_threshold,
     }
     buttons = [1 if button_values[name] else 0 for name in BUTTON_ORDER]
-    buttons.extend(int(bool(valid)) for valid in (
-        left.get("grip_valid", False), right.get("grip_valid", False),
-        left.get("trigger_valid", False), right.get("trigger_valid", False)))
     return axes, buttons

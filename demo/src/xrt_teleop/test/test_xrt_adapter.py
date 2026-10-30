@@ -3,7 +3,6 @@ import unittest
 
 from xrt_teleop.xrt_adapter import (
     DEFAULT_HEADSET_TO_ROBOT,
-    SourceFreshness,
     BUTTON_ORDER,
     joy_payload,
     matrix_3x3,
@@ -69,20 +68,11 @@ class XrtAdapterTest(unittest.TestCase):
             },
         )
         self.assertEqual(axes, [0.8, 0.2, 0.25, 0.9, 0.1, -0.2, -0.3, 0.4])
-        self.assertEqual(len(buttons), len(BUTTON_ORDER) + 4)
-        self.assertEqual(buttons[12:16], [0, 0, 0, 0])
+        self.assertEqual(len(buttons), len(BUTTON_ORDER))
         self.assertEqual(buttons[BUTTON_ORDER.index("X")], 1)
         self.assertEqual(buttons[BUTTON_ORDER.index("LG")], 1)
         self.assertEqual(buttons[BUTTON_ORDER.index("RG")], 0)
         self.assertEqual(buttons[BUTTON_ORDER.index("RTr")], 1)
-
-    def test_joy_read_validity_does_not_change_legacy_values(self):
-        axes, buttons = joy_payload(
-            {"grip": 0.9, "trigger": 0.8, "grip_valid": False, "trigger_valid": True},
-            {"grip": 0.0, "trigger": 0.1, "grip_valid": True, "trigger_valid": False})
-        self.assertEqual(axes[:4], [0.9, 0.0, 0.8, 0.1])
-        self.assertEqual(buttons[12:16], [0, 1, 1, 0])
-        self.assertEqual(buttons[8:12], [1, 0, 1, 0])
 
     def test_smoothing_spans_between_samples(self):
         position, _ = smooth_pose(
@@ -92,43 +82,6 @@ class XrtAdapterTest(unittest.TestCase):
             0.5,
         )
         self.assertEqual(position, (0.5, 1.0, 1.5))
-
-    def test_smoothing_preserves_equivalent_quaternion_signs(self):
-        previous = ((0.1, 0.2, 0.3), (0.5, 0.5, 0.5, 0.5))
-        position, quat = smooth_pose(previous, previous[0], (-0.5,) * 4, 0.4)
-        self.assertEqual(position, previous[0])
-        self.assertEqual(quat, previous[1])
-
-    def test_source_progress_is_independent_of_stationary_pose(self):
-        source = SourceFreshness(timeout_s=0.2)
-        for frame in range(100):
-            self.assertEqual(source.observe(1000 + frame, frame * 0.01), (True, True))
-
-    def test_duplicate_source_does_not_refresh_age(self):
-        source = SourceFreshness(timeout_s=0.2)
-        self.assertEqual(source.observe(1000, 1.0), (True, True))
-        self.assertEqual(source.observe(1000, 1.1), (True, False))
-        self.assertEqual(source.observe(1000, 1.201), (False, False))
-        self.assertEqual(source.last_advance_s, 1.0)
-        self.assertEqual(source.observe(1001, 1.21), (True, True))
-
-    def test_source_rollback_invalidates_frame(self):
-        source = SourceFreshness()
-        self.assertEqual(source.observe(1000, 1.0), (True, True))
-        self.assertEqual(source.observe(500, 1.1), (False, False))
-        self.assertEqual(source.observe(500, 1.12), (False, False))
-        self.assertEqual(source.observe(501, 1.13), (True, True))
-
-    def test_source_missing_is_fail_closed_unless_explicit_fallback(self):
-        self.assertEqual(SourceFreshness().observe(None, 1.0, False), (False, False))
-        fallback = SourceFreshness(require_timestamp=False)
-        self.assertEqual(fallback.observe(None, 1.0, False), (True, True))
-        # A present getter that fails is not silently replaced by receipt time.
-        self.assertEqual(fallback.observe(None, 1.0, True), (False, False))
-
-    def test_invalid_source_values(self):
-        for invalid in (None, 0, -1, True, 1.25, float("nan"), float("inf"), "oops"):
-            self.assertEqual(SourceFreshness().observe(invalid, 1.0), (False, False))
 
 
 if __name__ == "__main__":

@@ -8,27 +8,18 @@ import time
 from xrt_teleop.xrt_adapter import raw_pose_is_valid
 
 
-def _analog_text(sdk, getter_name):
-    """Show getter failures separately from a real, successfully read zero."""
+def _float(value, default=0.0):
     try:
-        raw = getattr(sdk, getter_name)()
-    except Exception as exc:
-        return "invalid(valid=False raw=unavailable error=%s: %s)" % (
-            type(exc).__name__, exc)
-    try:
-        value = float(raw)
-        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
-            return "invalid(valid=False raw=%r reason=outside_[0,1])" % (raw,)
-    except (TypeError, ValueError, OverflowError) as exc:
-        return "invalid(valid=False raw=%r error=%s: %s)" % (
-            raw, type(exc).__name__, exc)
-    return "%.3f(valid=True raw=%r)" % (value, raw)
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    return result if math.isfinite(result) else default
 
 
 def _pose_text(pose):
     if not raw_pose_is_valid(pose):
         return "untracked"
-    values = [float(value) for value in pose[:7]]
+    values = [_float(value) for value in pose[:7]]
     return (
         "pos=(%+.3f,%+.3f,%+.3f) quat=(%+.3f,%+.3f,%+.3f,%+.3f)"
         % (
@@ -43,18 +34,6 @@ def _pose_text(pose):
     )
 
 
-def _controller_text(sdk, side):
-    try:
-        pose = _pose_text(getattr(sdk, "get_%s_controller_pose" % side)())
-    except Exception as exc:
-        pose = "read_error(%s: %s)" % (type(exc).__name__, exc)
-    return "pose=%s grip=%s trigger=%s" % (
-        pose,
-        _analog_text(sdk, "get_%s_grip" % side),
-        _analog_text(sdk, "get_%s_trigger" % side),
-    )
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Stop run_teleop first, then run this to inspect Quest input."
@@ -62,9 +41,8 @@ def main(argv=None):
     parser.add_argument("--duration", type=float, default=0.0)
     parser.add_argument("--interval", type=float, default=0.5)
     args = parser.parse_args(argv)
-    if not math.isfinite(args.duration) or not math.isfinite(args.interval) \
-            or args.duration < 0.0 or args.interval <= 0.0:
-        parser.error("--duration must be finite and >= 0; --interval must be finite and > 0")
+    if args.duration < 0.0 or args.interval <= 0.0:
+        parser.error("--duration must be >= 0 and --interval must be > 0")
 
     try:
         import xrobotoolkit_sdk as xrt
@@ -75,12 +53,6 @@ def main(argv=None):
         )
         return 1
 
-    print("Python: executable=%s version=%s" % (sys.executable, sys.version.split()[0]))
-    print("XRoboToolkit SDK: module=%s file=%s version=%s" % (
-        getattr(xrt, "__name__", "xrobotoolkit_sdk"),
-        getattr(xrt, "__file__", "unavailable"),
-        getattr(xrt, "__version__", "unavailable"),
-    ))
     try:
         xrt.init()
     except Exception as exc:
@@ -94,17 +66,18 @@ def main(argv=None):
     )
     try:
         while deadline is None or time.monotonic() < deadline:
-            try:
-                source_ns = xrt.get_time_stamp_ns()
-            except Exception as exc:
-                source_ns = "unavailable(%s: %s)" % (type(exc).__name__, exc)
+            left_pose = xrt.get_left_controller_pose()
+            right_pose = xrt.get_right_controller_pose()
             print(
-                "source_ns=%s receipt_mono_s=%.6f | left: %s | right: %s"
+                "left:  %s grip=%.3f trigger=%.3f | "
+                "right: %s grip=%.3f trigger=%.3f"
                 % (
-                    source_ns,
-                    time.monotonic(),
-                    _controller_text(xrt, "left"),
-                    _controller_text(xrt, "right"),
+                    _pose_text(left_pose),
+                    _float(xrt.get_left_grip()),
+                    _float(xrt.get_left_trigger()),
+                    _pose_text(right_pose),
+                    _float(xrt.get_right_grip()),
+                    _float(xrt.get_right_trigger()),
                 ),
                 flush=True,
             )
