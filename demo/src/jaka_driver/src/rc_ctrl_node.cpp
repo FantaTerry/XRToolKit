@@ -8,6 +8,9 @@
 #include <cmath>
 #include <memory>
 #include <mutex>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -18,6 +21,7 @@
 #include "jaka_driver/jktypes.h"
 #include "jaka_driver/orientation_math.hpp"
 #include "jaka_driver/pgi140_gripper.hpp"
+#include "jaka_driver/servo_guard.hpp"
 
 using namespace std;
 
@@ -103,6 +107,312 @@ bool arm_is_right = false;  // mirror of arm_name == "right"
 double arm_tcp_y_at_grip = 0.0; // arm's absolute TCP y captured at grip press (mm)
 bool arm_tcp_valid = false;     // whether the grip-time TCP read succeeded
 
+// ---------------------------------------------------------------------------
+// Conservative servo governors. They sit between the hand mapping and
+// servo_p(INCR) and can only ever make the command smaller or later:
+//   leash : clamp the accumulated hand offset to a sphere round the grip point
+//   accel : bound how fast the per-cycle increment may change (mm/s^2)
+//   gate  : withhold new increments while the arm is measurably behind
+// Each one is switchable at runtime with `ros2 param set`; 0 disables it.
+// The gate is closed loop, so it stays off unless the measured SDK feedback
+// calls fit comfortably inside one 8 ms servo cycle.
+// ---------------------------------------------------------------------------
+double servo_leash_radius_mm = 600.0;
+double servo_trans_accel_mm_s2 = 1500.0;
+double servo_max_track_error_mm = 10.0;
+double servo_track_deadman_s = 2.0;
+double servo_feedback_budget_us = 200.0;   // average us per 8 ms cycle
+bool servo_feedback_enabled = true;
+// Optional wrist-singularity slow down. The wrist is singular when J5 is 0 or
+// +-180 deg, and there the same Cartesian step asks for a much larger joint
+// step. Disabled by default: it is a mitigation, not a diagnosis.
+bool servo_singularity_slowdown = false;
+double servo_singularity_threshold_deg = 15.0;
+double servo_singularity_min_scale = 0.35;
+bool actual_joints_valid = false;
+bool servo_timer_driven = true;   // one command per 8 ms window, from the timer
+double last_servo_send = 0.0;
+constexpr double PI_D = 3.14159265358979323846;
+// Max translation per 8 ms servo cycle. The old 5.0 mm/cycle value is 625 mm/s,
+// not the 125 mm/s its comment claimed, and that slew is what pushed joint 3
+// past the controller's position-deviation window near the offending pose.
+// 1.0 mm/cycle = 125 mm/s; live-tunable with servo_max_tran_step_mm.
+double servo_max_tran_step = 1.0;
+jaka_guard::AccelState guard_accel;
+
+constexpr double SERVO_CYCLE_S = 0.008;
+CartesianPose arm_tcp_at_grip{};   // commanded TCP captured at the Grip press
+CartesianPose actual_tcp{};        // get_actual_tcp_position()
+JointValue actual_joints{};        // get_actual_joint_position()
+bool actual_tcp_valid = false;
+double actual_tcp_time = 0.0;
+double last_feedback_us = 0.0;
+bool feedback_polling = false;
+int feedback_stride = 1;
+unsigned long feedback_tick = 0;
+bool status_polling = false;
+int status_stride = 13;
+unsigned long status_tick = 0;
+int last_errcode = 0;
+double track_hold_since = -1.0;
+bool track_gate_gave_up = false;
+rclcpp::Node::SharedPtr g_node;
+
+std::ofstream blackbox;
+double blackbox_flush_time = 0.0;
+
+bool servo_hold(JAKAZuRobot &robot);
+bool servo_send_allowed(double now);
+
+double steady_seconds()
+{
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Black box: one row per servo cycle plus event rows, so an alarm can be
+// replayed afterwards. It never changes control behaviour and every failure to
+// open or write it is non-fatal.
+void blackbox_header()
+{
+    blackbox << "t,kind,reason,incr_x,incr_y,incr_z,off_x,off_y,off_z,"
+                "cmd_x,cmd_y,cmd_z,act_x,act_y,act_z,fb_valid,j1,j2,j3,j4,j5,j6,"
+                "errcode,ret,held,fb_us\n";
+}
+
+void blackbox_line(const char *kind, const char *reason, const CartesianPose &incr,
+                   double ox, double oy, double oz,
+                   double cx, double cy, double cz, int ret, bool held)
+{
+    if (!blackbox.is_open())
+        return;
+    const double t = steady_seconds();
+    blackbox << t << ',' << kind << ',' << reason
+             << ',' << incr.tran.x << ',' << incr.tran.y << ',' << incr.tran.z
+             << ',' << ox << ',' << oy << ',' << oz
+             << ',' << cx << ',' << cy << ',' << cz
+             << ',' << actual_tcp.tran.x << ',' << actual_tcp.tran.y << ',' << actual_tcp.tran.z
+             << ',' << (actual_tcp_valid ? 1 : 0);
+    for (int i = 0; i < 6; ++i)
+        blackbox << ',' << actual_joints.jVal[i];
+    blackbox << ',' << last_errcode << ',' << ret << ',' << (held ? 1 : 0)
+             << ',' << last_feedback_us << '\n';
+    if (t - blackbox_flush_time > 1.0)
+    {
+        blackbox.flush();
+        blackbox_flush_time = t;
+    }
+}
+
+template <class F>
+double measure_us(F call, int repeats)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < repeats; ++i)
+        call();
+    const auto dt = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - t0).count();
+    return dt / static_cast<double>(repeats);
+}
+
+// Measure the real cost of the feedback getters once, then decide whether the
+// tracking gate is affordable and at what decimation. Nothing is assumed about
+// the SDK: if a call is slow or unsupported the gate simply stays off.
+void calibrate_servo_feedback()
+{
+    feedback_polling = false;
+    status_polling = false;
+    if (!servo_feedback_enabled)
+    {
+        RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                    "[%s] servo_feedback_enabled=false: tracking gate and alarm log are off",
+                    arm_name.c_str());
+        return;
+    }
+
+    CartesianPose tcp{};
+    JointValue joints{};
+    RobotStatus_simple status{};
+    const double tcp_us = measure_us([&]() {robot.get_actual_tcp_position(&tcp);}, 20);
+    const double joint_us = measure_us([&]() {robot.get_actual_joint_position(&joints);}, 20);
+    const double status_us = measure_us([&]() {robot.get_robot_status_simple(&status);}, 10);
+    const double motion_us = tcp_us + joint_us;
+
+    // A blocking getter inside the servo thread delays the next servo_p call, so
+    // the decimation is chosen for the average overhead per cycle (~200 us), not
+    // for a "looks fast enough" threshold. Above 2 ms per poll the gate is not
+    // worth the jitter at all and stays off.
+    feedback_stride = std::max(1, std::min(8,
+        static_cast<int>(std::ceil(motion_us / servo_feedback_budget_us))));
+    feedback_polling = (motion_us <= 2000.0);
+    status_stride = std::max(13, std::min(200,
+        static_cast<int>(std::ceil(status_us / 100.0))));
+    status_polling = (status_us <= 10000.0);
+
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] feedback calibration: tcp=%.0fus joints=%.0fus status=%.0fus "
+                "-> gate=%s every %d cycle(s) (%.0f us/cycle), "
+                "alarm log=%s every %d cycle(s) (%.0f us/cycle)",
+                arm_name.c_str(), tcp_us, joint_us, status_us,
+                feedback_polling ? "on" : "off", feedback_stride,
+                feedback_polling ? motion_us / feedback_stride : 0.0,
+                status_polling ? "on" : "off", status_stride,
+                status_polling ? status_us / status_stride : 0.0);
+    if (!feedback_polling)
+        RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                    "[%s] SDK motion feedback costs %.0f us per poll, too much for "
+                    "the 8 ms cycle; tracking gate stays off (leash and accel limit "
+                    "still apply)", arm_name.c_str(), motion_us);
+}
+
+// Poll the measured state and the controller alarm code, at the decimation the
+// calibration chose. Called from the 8 ms timer, in the same thread as servo_p.
+void poll_servo_feedback()
+{
+    if (feedback_polling && (++feedback_tick % static_cast<unsigned long>(feedback_stride) == 0))
+    {
+        CartesianPose tcp{};
+        JointValue joints{};
+        const double t0 = steady_seconds();
+        const int ret_tcp = robot.get_actual_tcp_position(&tcp);
+        const int ret_joint = robot.get_actual_joint_position(&joints);
+        last_feedback_us = (steady_seconds() - t0) * 1e6;
+        actual_tcp_valid = (ret_tcp == 0);
+        if (ret_tcp == 0)
+            actual_tcp = tcp;
+        actual_joints_valid = (ret_joint == 0);
+        if (ret_joint == 0)
+            actual_joints = joints;
+        actual_tcp_time = steady_seconds();
+    }
+
+    if (status_polling && (++status_tick % static_cast<unsigned long>(status_stride) == 0))
+    {
+        RobotStatus_simple status{};
+        if (robot.get_robot_status_simple(&status) == 0)
+        {
+            const int errcode = status.errcode;
+            if (errcode != last_errcode)
+            {
+                size_t msg_len = 0;
+                while (msg_len < sizeof(status.errmsg) && status.errmsg[msg_len] != '\0')
+                    ++msg_len;
+                const std::string msg(status.errmsg, msg_len);
+                CartesianPose none{};
+                if (errcode != 0)
+                    RCLCPP_ERROR(rclcpp::get_logger("rc_ctrl"),
+                                 "[%s] CONTROLLER ALARM errcode=%d (0x%X) msg='%s'",
+                                 arm_name.c_str(), errcode, static_cast<unsigned>(errcode),
+                                 msg.c_str());
+                else
+                    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                                "[%s] controller alarm cleared (was %d)",
+                                arm_name.c_str(), last_errcode);
+                last_errcode = errcode;
+                blackbox_line("event", errcode != 0 ? "alarm" : "alarm_cleared", none,
+                              0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, false);
+                if (blackbox.is_open())
+                    blackbox.flush();
+            }
+        }
+    }
+}
+
+// Re-read the governor limits so they can be changed with `ros2 param set`
+// while the node runs. Invalid values are ignored, never applied.
+void refresh_governor_params()
+{
+    if (!g_node)
+        return;
+    double value = 0.0;
+    if (g_node->get_parameter("servo_max_tran_step_mm", value) &&
+        std::isfinite(value) && value > 0.0 && value <= 5.0)
+        servo_max_tran_step = value;
+    if (g_node->get_parameter("servo_leash_radius_mm", value) &&
+        std::isfinite(value) && value >= 0.0)
+        servo_leash_radius_mm = value;
+    if (g_node->get_parameter("servo_trans_accel_mm_s2", value) &&
+        std::isfinite(value) && value >= 0.0)
+        servo_trans_accel_mm_s2 = value;
+    if (g_node->get_parameter("servo_max_track_error_mm", value) &&
+        std::isfinite(value) && value >= 0.0)
+        servo_max_track_error_mm = value;
+    if (g_node->get_parameter("servo_singularity_threshold_deg", value) &&
+        std::isfinite(value) && value >= 0.0 && value < 90.0)
+        servo_singularity_threshold_deg = value;
+    if (g_node->get_parameter("servo_singularity_min_scale", value) &&
+        std::isfinite(value) && value > 0.0 && value <= 1.0)
+        servo_singularity_min_scale = value;
+    bool flag = false;
+    if (g_node->get_parameter("servo_singularity_slowdown", flag))
+        servo_singularity_slowdown = flag;
+    if (g_node->get_parameter("servo_timer_driven", flag))
+        servo_timer_driven = flag;
+}
+
+// Angle to the nearest wrist singularity, in radians. JAKA reports joint values
+// in radians (jktypes.h), so |J5| itself is the measure once wrapped.
+double wrist_singularity_angle()
+{
+    double j5 = actual_joints.jVal[4];
+    if (!std::isfinite(j5))
+        return 0.0;
+    double wrapped = std::fmod(j5, 2.0 * PI_D);
+    if (wrapped < 0.0)
+        wrapped += 2.0 * PI_D;
+    const double to_zero = std::min(wrapped, 2.0 * PI_D - wrapped);
+    const double to_pi = std::fabs(wrapped - PI_D);
+    return std::min(to_zero, to_pi);
+}
+
+double singularity_scale()
+{
+    const double threshold = servo_singularity_threshold_deg * PI_D / 180.0;
+    if (!(threshold > 0.0))
+        return 1.0;
+    const double ratio = std::sin(wrist_singularity_angle()) / std::sin(threshold);
+    return std::max(servo_singularity_min_scale, std::min(1.0, ratio));
+}
+
+// One-shot readout of the controller configuration. This is diagnostic only:
+// a wrong payload or a TCP that does not match the real tool is one of the few
+// things that produce a load dependent joint deviation alarm.
+void log_robot_configuration()
+{
+    char version[256] = {0};
+    int tool_id = -1;
+    int user_id = -1;
+    PayLoad payload{};
+    JointValue joints{};
+    const int ret_version = robot.get_sdk_version(version);
+    const int ret_tool = robot.get_tool_id(&tool_id);
+    const int ret_user = robot.get_user_frame_id(&user_id);
+    const int ret_payload = robot.get_payload(&payload);
+    const int ret_joints = robot.get_actual_joint_position(&joints);
+
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] controller: sdk='%s'(ret=%d) tool=%d(ret=%d) user=%d(ret=%d)",
+                arm_name.c_str(), version, ret_version, tool_id, ret_tool,
+                user_id, ret_user);
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] payload: mass=%.3f kg centroid=(%.1f,%.1f,%.1f) mm (ret=%d); "
+                "a zero or stale payload makes gravity compensation wrong and "
+                "shows up as a load dependent joint deviation alarm",
+                arm_name.c_str(), payload.mass, payload.centroid.x, payload.centroid.y,
+                payload.centroid.z, ret_payload);
+    if (ret_joints == 0)
+    {
+        actual_joints = joints;
+        actual_joints_valid = true;
+        RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                    "[%s] joints(rad): %.4f %.4f %.4f %.4f %.4f %.4f -> J5 is %.1f deg "
+                    "from the wrist singularity",
+                    arm_name.c_str(), joints.jVal[0], joints.jVal[1], joints.jVal[2],
+                    joints.jVal[3], joints.jVal[4], joints.jVal[5],
+                    wrist_singularity_angle() * 180.0 / PI_D);
+    }
+}
+
 // Convert a PoseStamped (position in meters + quaternion) into a controller pose
 // (translation in mm + quaternion). No RPY conversion here — the RPY delta is
 // computed from quaternions in servo_cartesian().
@@ -129,12 +439,6 @@ bool pose_to_ctrl(const geometry_msgs::msg::PoseStamped &msg,
 // Per-cycle Cartesian servo limits. servo_p is fed one increment per 8 ms
 // interpolation cycle.
 constexpr double SERVO_TRAN_DEADBAND = 0.5;   // mm: ignore smaller translation deltas
-// Max translation per 8 ms servo cycle. The previous 5.0 mm/cycle value is
-// 625 mm/s, not the 125 mm/s its comment claimed, and that slew is what pushed
-// joint 3 past the controller's position-deviation window near the offending
-// pose. 1.0 mm/cycle = 125 mm/s; override at runtime with
-// servo_max_tran_step_mm, lower it further if the alarm still appears.
-double servo_max_tran_step = 1.0;
 constexpr double Y_LIMIT_MM = 110.0;         // workspace y boundary: left > -110, right < +110
 
 // Drive one arm to track the controller's displacement since grip press, in
@@ -150,13 +454,33 @@ constexpr double Y_LIMIT_MM = 110.0;         // workspace y boundary: left > -11
 // frame. We maintain the cumulative rotation actually sent to the robot, so a
 // per-cycle speed clamp does not silently discard part of a fast hand rotation.
 void servo_cartesian(JAKAZuRobot &robot,
-                     const geometry_msgs::msg::PoseStamped::SharedPtr msg,
+                     const geometry_msgs::msg::PoseStamped &msg,
                      const CtrlPose &ctrl_origin,
                      CtrlPose &ctrl_prev,
                      const char *arm_name)
 {
+    refresh_governor_params();
+
+    // Per-cycle command caps. The optional singularity term shrinks both the
+    // translation and the rotation step when J5 approaches 0 or +-180 deg, where
+    // the same Cartesian command costs a much larger joint motion.
+    double step_cap = servo_max_tran_step;
+    double rot_cap = rotation_max_step;
+    if (servo_singularity_slowdown && actual_joints_valid)
+    {
+        const double scale = singularity_scale();
+        step_cap *= scale;
+        rot_cap *= scale;
+        static int sing_count = 0;
+        if (scale < 0.999 && ++sing_count % 50 == 0)
+            RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                        "[%s] near wrist singularity: J5 is %.1f deg from 0/180, "
+                        "step scaled to %.0f%%", arm_name,
+                        wrist_singularity_angle() * 180.0 / PI_D, scale * 100.0);
+    }
+
     CtrlPose ctrl_now;
-    if (!pose_to_ctrl(*msg, ctrl_now))
+    if (!pose_to_ctrl(msg, ctrl_now))
     {
         if (debug)
         {
@@ -179,6 +503,28 @@ void servo_cartesian(JAKAZuRobot &robot,
             ctrl_now.tran.y = ctrl_origin.tran.y + (Y_LIMIT_MM - arm_tcp_y_at_grip);
         else if (!arm_is_right && pred_y < -Y_LIMIT_MM)
             ctrl_now.tran.y = ctrl_origin.tran.y + (-Y_LIMIT_MM - arm_tcp_y_at_grip);
+    }
+
+    // Leash: keep the hand displacement since the Grip press inside a sphere.
+    // It is a relative displacement, so it needs no frame calibration and cannot
+    // fight the y-limit; it only stops the operator from asking for a target the
+    // arm cannot reach.
+    if (servo_leash_radius_mm > 0.0)
+    {
+        double off_x = ctrl_now.tran.x - ctrl_origin.tran.x;
+        double off_y = ctrl_now.tran.y - ctrl_origin.tran.y;
+        double off_z = ctrl_now.tran.z - ctrl_origin.tran.z;
+        if (jaka_guard::clamp_sphere(servo_leash_radius_mm, off_x, off_y, off_z))
+        {
+            ctrl_now.tran.x = ctrl_origin.tran.x + off_x;
+            ctrl_now.tran.y = ctrl_origin.tran.y + off_y;
+            ctrl_now.tran.z = ctrl_origin.tran.z + off_z;
+            static int leash_count = 0;
+            if (++leash_count % 50 == 0)
+                RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                            "[%s] leash: hand offset clamped to %.0f mm",
+                            arm_name, servo_leash_radius_mm);
+        }
     }
 
     CartesianPose incr;
@@ -220,7 +566,7 @@ void servo_cartesian(JAKAZuRobot &robot,
         if (remaining_angle >= rotation_deadband && rotation_gain > 0.0)
         {
             const double requested_step = remaining_angle * rotation_gain;
-            const double applied_step = std::min(requested_step, rotation_max_step);
+            const double applied_step = std::min(requested_step, rot_cap);
             rotation_step = jaka_teleop::quat_scaled_to_angle(
                 remaining_rotation, applied_step);
             has_rotation_step = applied_step > 1e-6;
@@ -281,21 +627,99 @@ void servo_cartesian(JAKAZuRobot &robot,
     // Velocity clamp: scale translation to its per-cycle cap, preserving
     // direction. A fast handle swing moves the arm at the capped speed instead
     // of commanding an overspeed Cartesian move.
-    if (max_tran > servo_max_tran_step)
+    if (max_tran > step_cap)
     {
-        double s = servo_max_tran_step / max_tran;
+        double s = step_cap / max_tran;
         incr.tran.x *= s;
         incr.tran.y *= s;
         incr.tran.z *= s;
     }
+
+    // Acceleration limit: bound how fast the per-cycle increment may change, so
+    // a sudden handle motion cannot ask the controller for a velocity step.
+    jaka_guard::limit_accel(servo_trans_accel_mm_s2, SERVO_CYCLE_S, guard_accel,
+                            incr.tran.x, incr.tran.y, incr.tran.z);
+
+    // Commanded TCP = grip TCP + accumulated hand offset. Rotation happens about
+    // the TCP, so it does not move this point.
+    const double off_x = ctrl_now.tran.x - ctrl_origin.tran.x;
+    const double off_y = ctrl_now.tran.y - ctrl_origin.tran.y;
+    const double off_z = ctrl_now.tran.z - ctrl_origin.tran.z;
+    const double cmd_x = arm_tcp_at_grip.tran.x + off_x;
+    const double cmd_y = arm_tcp_at_grip.tran.y + off_y;
+    const double cmd_z = arm_tcp_at_grip.tran.z + off_z;
+
+    // Tracking gate: withhold the increment while the arm is measurably behind
+    // the commanded point. ctrl_prev is deliberately NOT advanced, so the
+    // pending motion collapses onto the current hand pose instead of queueing.
+    bool held = false;
+    double behind = -1.0;
+    const double now_s = steady_seconds();
+    // A decimated poll is still usable, so the staleness window follows the
+    // measured step count instead of a fixed 50 ms.
+    const double feedback_max_age_s = 0.02 + SERVO_CYCLE_S * feedback_stride * 3.0;
+    if (servo_max_track_error_mm > 0.0 && actual_tcp_valid && arm_tcp_valid &&
+        !track_gate_gave_up && now_s - actual_tcp_time <= feedback_max_age_s)
+    {
+        behind = jaka_guard::distance_mm(
+            cmd_x, cmd_y, cmd_z, actual_tcp.tran.x, actual_tcp.tran.y, actual_tcp.tran.z);
+        if (behind > servo_max_track_error_mm)
+        {
+            if (track_hold_since < 0.0)
+                track_hold_since = now_s;
+            if (now_s - track_hold_since > servo_track_deadman_s)
+            {
+                track_gate_gave_up = true;
+                RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                            "[%s] tracking gate gave up: arm stayed %.1f mm behind for "
+                            "%.1f s; release and press Grip to re-arm the gate",
+                            arm_name, behind, servo_track_deadman_s);
+            }
+            else
+            {
+                held = true;
+            }
+        }
+        else
+        {
+            track_hold_since = -1.0;
+        }
+    }
+    else
+    {
+        track_hold_since = -1.0;
+    }
+
+    if (held)
+    {
+        servo_hold(robot);
+        blackbox_line("servo", "track_hold", incr, off_x, off_y, off_z,
+                      cmd_x, cmd_y, cmd_z, 0, true);
+        static int hold_count = 0;
+        if (++hold_count % 125 == 0)
+            RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                        "[%s] holding: arm is %.1f mm behind the commanded point",
+                        arm_name, behind);
+        return;
+    }
+
+    if (!servo_timer_driven && !servo_send_allowed(now_s))
+        return;  // the previous interpolation window is still open; retry next tick
 
     int ret = robot.servo_p(&incr, MoveMode::INCR);
     if (ret != 0)
     {
         RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
                     "[%s] servo_p failed: %s", arm_name, mapErr[ret].c_str());
+        blackbox_line("servo", "failed", incr, off_x, off_y, off_z,
+                      cmd_x, cmd_y, cmd_z, ret, false);
         return;
     }
+    guard_accel.x = incr.tran.x;
+    guard_accel.y = incr.tran.y;
+    guard_accel.z = incr.tran.z;
+    blackbox_line("servo", "sent", incr, off_x, off_y, off_z,
+                  cmd_x, cmd_y, cmd_z, ret, false);
 
     // Track what we actually commanded so the next cycle's delta is measured
     // from the same reference the robot is using.
@@ -326,6 +750,22 @@ void servo_cartesian(JAKAZuRobot &robot,
     }
 }
 
+// The controller interpolates exactly one step_num*8 ms window per servo_p call.
+// A second command that arrives before that window closes makes the controller
+// report a "continuous servo command" warning and drop the step, which is
+// exactly how a joint position deviation gets started. A wall timer never fires
+// early, so driving the servo from the 8 ms timer guarantees the window; this
+// guard only protects the legacy message-driven path against collisions.
+constexpr double SERVO_MIN_GAP_S = 0.006;
+
+bool servo_send_allowed(double now)
+{
+    if (now - last_servo_send < SERVO_MIN_GAP_S)
+        return false;
+    last_servo_send = now;
+    return true;
+}
+
 bool servo_hold(JAKAZuRobot &robot)
 {
     CartesianPose hold;
@@ -345,6 +785,7 @@ bool servo_hold(JAKAZuRobot &robot)
         }
         return false;
     }
+    guard_accel.reset();
     return true;
 }
 
@@ -354,7 +795,25 @@ bool servo_hold(JAKAZuRobot &robot)
 // last joint target while its clutch is disengaged.
 void hold_stream_callback()
 {
-    if (!arm_ok || gripped || rearming || !hold_stream_enabled)
+    // The SDK connection is single-owner: never poll it while the re-arm thread
+    // is inside power_on/enable/servo_move_enable.
+    if (!arm_ok || rearming)
+        return;
+    poll_servo_feedback();
+
+    // Timer-driven servo: exactly one command per 8 ms window, whatever the ROS
+    // message jitter is. The message-driven path is kept as a fallback.
+    if (gripped && servo_timer_driven)
+    {
+        geometry_msgs::msg::PoseStamped pose;
+        {
+            std::lock_guard<std::mutex> lk(latest_mtx);
+            pose = latest_pose;
+        }
+        servo_cartesian(robot, pose, ctrl_origin, ctrl_prev, arm_name.c_str());
+        return;
+    }
+    if (gripped || !hold_stream_enabled)
         return;
 
     if (!servo_hold(robot))
@@ -495,7 +954,15 @@ void rearm_worker()
         CartesianPose tcp_at_grip;
         arm_tcp_valid = (robot.get_tcp_position(&tcp_at_grip) == 0);
         if (arm_tcp_valid)
+        {
             arm_tcp_y_at_grip = tcp_at_grip.tran.y;
+            arm_tcp_at_grip = tcp_at_grip;
+        }
+        // Every Grip press starts a clean governor epoch: no inherited velocity
+        // and a fresh chance for the tracking gate.
+        guard_accel.reset();
+        track_hold_since = -1.0;
+        track_gate_gave_up = false;
         // Write origin/prev BEFORE publishing gripped=true so the atomic gate
         // makes these writes visible to target_callback.
         ctrl_origin = origin;
@@ -541,9 +1008,10 @@ void handle_grip(float value)
     else if (!now)
     {
         gripped = false;
-        const bool hold_already_streaming = hold_stream_enabled.exchange(true);
-        if (!hold_already_streaming && !rearming && arm_ok)
-            servo_hold(robot);
+        // Let the 8 ms timer send the first zero increment. Calling servo_hold
+        // here as well lands inside the window of the previous command often
+        // enough that the controller reports a continuous-servo-command warning.
+        hold_stream_enabled = true;
     }
 }
 
@@ -555,9 +1023,9 @@ void target_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
         std::lock_guard<std::mutex> lk(latest_mtx);
         latest_pose = *msg;
     }
-    if (gripped)
+    if (gripped && !servo_timer_driven)
     {
-        servo_cartesian(robot, msg, ctrl_origin, ctrl_prev, arm_name.c_str());
+        servo_cartesian(robot, *msg, ctrl_origin, ctrl_prev, arm_name.c_str());
     }
     // Not gripped: the independent 125 Hz timer keeps sending zero increments.
     if(debug)
@@ -736,6 +1204,7 @@ int main(int argc, char *argv[])
     setlocale(LC_ALL, "C");
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("rc_ctrl_node");
+    g_node = node;
 
     // Which arm this process controls. The JAKA SDK limits us to one connection
     // per process, so one instance drives exactly one arm and the launch file
@@ -822,6 +1291,70 @@ int main(int argc, char *argv[])
        servo_max_tran_step = 1.0;
    }
 
+   // Conservative governor limits. All are live-tunable with `ros2 param set`.
+   servo_leash_radius_mm = node->declare_parameter<double>(
+       "servo_leash_radius_mm", 600.0);
+   servo_trans_accel_mm_s2 = node->declare_parameter<double>(
+       "servo_trans_accel_mm_s2", 1500.0);
+   servo_max_track_error_mm = node->declare_parameter<double>(
+       "servo_max_track_error_mm", 10.0);
+   servo_track_deadman_s = node->declare_parameter<double>(
+       "servo_track_deadman_s", 2.0);
+   servo_feedback_enabled = node->declare_parameter<bool>(
+       "servo_feedback_enabled", true);
+   servo_feedback_budget_us = node->declare_parameter<double>(
+       "servo_feedback_budget_us", 200.0);
+   servo_singularity_slowdown = node->declare_parameter<bool>(
+       "servo_singularity_slowdown", false);
+   servo_singularity_threshold_deg = node->declare_parameter<double>(
+       "servo_singularity_threshold_deg", 15.0);
+   servo_singularity_min_scale = node->declare_parameter<double>(
+       "servo_singularity_min_scale", 0.35);
+   servo_timer_driven = node->declare_parameter<bool>(
+       "servo_timer_driven", true);
+   const std::string blackbox_dir = node->declare_parameter<std::string>(
+       "servo_blackbox_dir", std::string("log/teleop"));
+   if (!std::isfinite(servo_leash_radius_mm) || servo_leash_radius_mm < 0.0)
+       servo_leash_radius_mm = 600.0;
+   if (!std::isfinite(servo_trans_accel_mm_s2) || servo_trans_accel_mm_s2 < 0.0)
+       servo_trans_accel_mm_s2 = 1500.0;
+   if (!std::isfinite(servo_max_track_error_mm) || servo_max_track_error_mm < 0.0)
+       servo_max_track_error_mm = 10.0;
+   if (!std::isfinite(servo_track_deadman_s) || servo_track_deadman_s < 0.0)
+       servo_track_deadman_s = 2.0;
+   if (!std::isfinite(servo_feedback_budget_us) || servo_feedback_budget_us < 50.0)
+       servo_feedback_budget_us = 200.0;
+   if (!std::isfinite(servo_singularity_threshold_deg) ||
+       servo_singularity_threshold_deg < 0.0 || servo_singularity_threshold_deg >= 90.0)
+       servo_singularity_threshold_deg = 15.0;
+   if (!std::isfinite(servo_singularity_min_scale) ||
+       servo_singularity_min_scale <= 0.0 || servo_singularity_min_scale > 1.0)
+       servo_singularity_min_scale = 0.35;
+
+   if (!blackbox_dir.empty())
+   {
+       std::error_code ec;
+       std::filesystem::create_directories(blackbox_dir, ec);
+       const auto stamp = std::to_string(std::chrono::duration_cast<
+           std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch()).count());
+       const std::string path = blackbox_dir + "/" + arm_name + "_" + stamp + ".csv";
+       blackbox.open(path, std::ios::out | std::ios::trunc);
+       if (blackbox.is_open())
+       {
+           blackbox_header();
+           blackbox.flush();
+           RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                       "[%s] black box: %s", arm_name.c_str(), path.c_str());
+       }
+       else
+       {
+           RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                       "[%s] cannot open black box '%s'; continuing without it",
+                       arm_name.c_str(), path.c_str());
+       }
+   }
+
    rotation_scale = std::max(0.0, std::min(1.0, rotation_scale));
    rotation_gain = std::max(0.0, std::min(1.0, rotation_gain));
    rotation_deadband = std::max(0.0, rotation_deadband);
@@ -857,6 +1390,11 @@ int main(int argc, char *argv[])
     {
         gripper.reset();
     }
+    if (arm_ok)
+    {
+        calibrate_servo_feedback();
+        log_robot_configuration();
+    }
 
     // Subscribe to the handle target topic and the shared button topic.
     // keep_last(1): teleop 控制循环只关心最新一帧，depth=10 会在消费端稍慢时
@@ -885,6 +1423,16 @@ int main(int argc, char *argv[])
     RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
                 "[%s] servo translation cap: %.2f mm/8 ms cycle (%.0f mm/s)",
                 arm_name.c_str(), servo_max_tran_step, servo_max_tran_step * 125.0);
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] governors: leash=%.0fmm accel=%.0fmm/s2 track_gate=%.1fmm "
+                "deadman=%.1fs singularity=%s(%.0fdeg,min %.2f) timer_driven=%s "
+                "blackbox=%s",
+                arm_name.c_str(), servo_leash_radius_mm, servo_trans_accel_mm_s2,
+                servo_max_track_error_mm, servo_track_deadman_s,
+                servo_singularity_slowdown ? "on" : "off",
+                servo_singularity_threshold_deg, servo_singularity_min_scale,
+                servo_timer_driven ? "on" : "off",
+                blackbox.is_open() ? "on" : "off");
 
     rclcpp::spin(node);
 
@@ -912,6 +1460,11 @@ int main(int argc, char *argv[])
         }
         robot.servo_move_enable(false);
         robot.login_out();
+    }
+    if (blackbox.is_open())
+    {
+        blackbox.flush();
+        blackbox.close();
     }
     rclcpp::shutdown();
     return 0;
