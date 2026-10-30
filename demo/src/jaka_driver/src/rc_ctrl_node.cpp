@@ -129,7 +129,12 @@ bool pose_to_ctrl(const geometry_msgs::msg::PoseStamped &msg,
 // Per-cycle Cartesian servo limits. servo_p is fed one increment per 8 ms
 // interpolation cycle.
 constexpr double SERVO_TRAN_DEADBAND = 0.5;   // mm: ignore smaller translation deltas
-constexpr double SERVO_MAX_TRAN_STEP = 5.0;   // mm per cycle (~125 mm/s)
+// Max translation per 8 ms servo cycle. The previous 5.0 mm/cycle value is
+// 625 mm/s, not the 125 mm/s its comment claimed, and that slew is what pushed
+// joint 3 past the controller's position-deviation window near the offending
+// pose. 1.0 mm/cycle = 125 mm/s; override at runtime with
+// servo_max_tran_step_mm, lower it further if the alarm still appears.
+double servo_max_tran_step = 1.0;
 constexpr double Y_LIMIT_MM = 110.0;         // workspace y boundary: left > -110, right < +110
 
 // Drive one arm to track the controller's displacement since grip press, in
@@ -276,9 +281,9 @@ void servo_cartesian(JAKAZuRobot &robot,
     // Velocity clamp: scale translation to its per-cycle cap, preserving
     // direction. A fast handle swing moves the arm at the capped speed instead
     // of commanding an overspeed Cartesian move.
-    if (max_tran > SERVO_MAX_TRAN_STEP)
+    if (max_tran > servo_max_tran_step)
     {
-        double s = SERVO_MAX_TRAN_STEP / max_tran;
+        double s = servo_max_tran_step / max_tran;
         incr.tran.x *= s;
         incr.tran.y *= s;
         incr.tran.z *= s;
@@ -806,6 +811,16 @@ int main(int argc, char *argv[])
    grip_release_threshold = node->declare_parameter<double>(
        "grip_release_threshold", 0.4);
    enable_y_limit = node->declare_parameter<bool>("enable_y_limit", true);
+   servo_max_tran_step = node->declare_parameter<double>(
+       "servo_max_tran_step_mm", 1.0);
+   if (!std::isfinite(servo_max_tran_step) || servo_max_tran_step <= 0.0 ||
+       servo_max_tran_step > 5.0)
+   {
+       RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
+                   "[%s] servo_max_tran_step_mm must be in (0, 5]; using 1.0",
+                   arm_name.c_str());
+       servo_max_tran_step = 1.0;
+   }
 
    rotation_scale = std::max(0.0, std::min(1.0, rotation_scale));
    rotation_gain = std::max(0.0, std::min(1.0, rotation_gain));
@@ -867,6 +882,9 @@ int main(int argc, char *argv[])
                 "[%s] grip hysteresis: press>%.2f release<%.2f; "
                 "continuous 125 Hz hold when disengaged",
                 arm_name.c_str(), grip_press_threshold, grip_release_threshold);
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] servo translation cap: %.2f mm/8 ms cycle (%.0f mm/s)",
+                arm_name.c_str(), servo_max_tran_step, servo_max_tran_step * 125.0);
 
     rclcpp::spin(node);
 
