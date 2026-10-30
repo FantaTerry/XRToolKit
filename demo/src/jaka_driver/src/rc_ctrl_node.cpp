@@ -130,7 +130,12 @@ bool servo_singularity_slowdown = false;
 double servo_singularity_threshold_deg = 15.0;
 double servo_singularity_min_scale = 0.35;
 bool actual_joints_valid = false;
-bool servo_timer_driven = true;   // one command per 8 ms window, from the timer
+double actual_joints_time = 0.0;
+// The controller opens one step_num*8 ms interpolation window per servo_p call.
+// A second command inside that window is reported as a continuous servo command
+// and the step is dropped, so the message driven path keeps a minimum spacing.
+double servo_min_period_s = 0.0085;
+bool servo_timer_driven = false;  // true: one command per window from the timer
 double last_servo_send = 0.0;
 constexpr double PI_D = 3.14159265358979323846;
 // Max translation per 8 ms servo cycle. The old 5.0 mm/cycle value is 625 mm/s,
@@ -215,13 +220,19 @@ double measure_us(F call, int repeats)
     return dt / static_cast<double>(repeats);
 }
 
-// Measure the real cost of the feedback getters once, then decide whether the
-// tracking gate is affordable and at what decimation. Nothing is assumed about
-// the SDK: if a call is slow or unsupported the gate simply stays off.
+// Measure the real cost of every candidate feedback getter once, then pick the
+// cheapest one that actually returns data. get_actual_* is not available on
+// every controller, and get_robot_status() returns TCP, the six joints and the
+// error code in a single call, so it is often both cheaper and more complete.
+// 0 = none, 1 = get_actual_tcp_position + get_actual_joint_position,
+// 2 = get_robot_status.
+int feedback_source = 0;
+
 void calibrate_servo_feedback()
 {
     feedback_polling = false;
     status_polling = false;
+    feedback_source = 0;
     if (!servo_feedback_enabled)
     {
         RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
@@ -232,37 +243,58 @@ void calibrate_servo_feedback()
 
     CartesianPose tcp{};
     JointValue joints{};
+    RobotStatus big{};
     RobotStatus_simple status{};
+    const bool tcp_ok = (robot.get_actual_tcp_position(&tcp) == 0);
+    const bool joint_ok = (robot.get_actual_joint_position(&joints) == 0);
+    const bool big_ok = (robot.get_robot_status(&big) == 0);
     const double tcp_us = measure_us([&]() {robot.get_actual_tcp_position(&tcp);}, 20);
     const double joint_us = measure_us([&]() {robot.get_actual_joint_position(&joints);}, 20);
+    const double big_us = measure_us([&]() {robot.get_robot_status(&big);}, 10);
     const double status_us = measure_us([&]() {robot.get_robot_status_simple(&status);}, 10);
-    const double motion_us = tcp_us + joint_us;
+    const double pair_us = tcp_us + joint_us;
+
+    double motion_us = 0.0;
+    if (big_ok && (!tcp_ok || !joint_ok || big_us <= pair_us))
+    {
+        feedback_source = 2;
+        motion_us = big_us;
+    }
+    else if (tcp_ok && joint_ok)
+    {
+        feedback_source = 1;
+        motion_us = pair_us;
+    }
 
     // A blocking getter inside the servo thread delays the next servo_p call, so
-    // the decimation is chosen for the average overhead per cycle (~200 us), not
-    // for a "looks fast enough" threshold. Above 2 ms per poll the gate is not
-    // worth the jitter at all and stays off.
+    // the decimation is chosen for the average overhead per cycle, not for a
+    // "looks fast enough" threshold.
     feedback_stride = std::max(1, std::min(8,
         static_cast<int>(std::ceil(motion_us / servo_feedback_budget_us))));
-    feedback_polling = (motion_us <= 2000.0);
+    feedback_polling = (feedback_source != 0) && (motion_us <= 4000.0);
     status_stride = std::max(13, std::min(200,
         static_cast<int>(std::ceil(status_us / 100.0))));
     status_polling = (status_us <= 10000.0);
 
     RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
-                "[%s] feedback calibration: tcp=%.0fus joints=%.0fus status=%.0fus "
-                "-> gate=%s every %d cycle(s) (%.0f us/cycle), "
-                "alarm log=%s every %d cycle(s) (%.0f us/cycle)",
-                arm_name.c_str(), tcp_us, joint_us, status_us,
-                feedback_polling ? "on" : "off", feedback_stride,
-                feedback_polling ? motion_us / feedback_stride : 0.0,
-                status_polling ? "on" : "off", status_stride,
-                status_polling ? status_us / status_stride : 0.0);
+                "[%s] feedback calibration: actual_tcp=%.0fus(ok=%d) actual_joints=%.0fus(ok=%d) "
+                "robot_status=%.0fus(ok=%d) simple=%.0fus",
+                arm_name.c_str(), tcp_us, tcp_ok ? 1 : 0, joint_us, joint_ok ? 1 : 0,
+                big_us, big_ok ? 1 : 0, status_us);
+    RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
+                "[%s] feedback source=%s every %d cycle(s) (%.0f us/cycle), "
+                "gate=%s, alarm log=%s every %d cycle(s)",
+                arm_name.c_str(),
+                feedback_source == 2 ? "robot_status" : (feedback_source == 1 ? "actual_*" : "none"),
+                feedback_stride, feedback_polling ? motion_us / feedback_stride : 0.0,
+                feedback_polling ? "on" : "off",
+                status_polling ? "on" : "off", status_stride);
     if (!feedback_polling)
         RCLCPP_WARN(rclcpp::get_logger("rc_ctrl"),
-                    "[%s] SDK motion feedback costs %.0f us per poll, too much for "
-                    "the 8 ms cycle; tracking gate stays off (leash and accel limit "
-                    "still apply)", arm_name.c_str(), motion_us);
+                    "[%s] no affordable motion feedback (robot_status=%.0fus ok=%d, "
+                    "actual=%.0fus ok=%d/%d); tracking gate and singularity slow down "
+                    "stay off", arm_name.c_str(), big_us, big_ok ? 1 : 0,
+                    pair_us, tcp_ok ? 1 : 0, joint_ok ? 1 : 0);
 }
 
 // Poll the measured state and the controller alarm code, at the decimation the
@@ -271,19 +303,45 @@ void poll_servo_feedback()
 {
     if (feedback_polling && (++feedback_tick % static_cast<unsigned long>(feedback_stride) == 0))
     {
-        CartesianPose tcp{};
-        JointValue joints{};
         const double t0 = steady_seconds();
-        const int ret_tcp = robot.get_actual_tcp_position(&tcp);
-        const int ret_joint = robot.get_actual_joint_position(&joints);
+        if (feedback_source == 2)
+        {
+            RobotStatus st{};
+            if (robot.get_robot_status(&st) == 0)
+            {
+                actual_tcp.tran.x = st.cartesiantran_position[0];
+                actual_tcp.tran.y = st.cartesiantran_position[1];
+                actual_tcp.tran.z = st.cartesiantran_position[2];
+                actual_tcp.rpy.rx = st.cartesiantran_position[3];
+                actual_tcp.rpy.ry = st.cartesiantran_position[4];
+                actual_tcp.rpy.rz = st.cartesiantran_position[5];
+                for (int i = 0; i < 6; ++i)
+                    actual_joints.jVal[i] = st.joint_position[i];
+                actual_tcp_valid = true;
+                actual_joints_valid = true;
+                actual_tcp_time = actual_joints_time = steady_seconds();
+            }
+            else
+            {
+                actual_tcp_valid = false;
+                actual_joints_valid = false;
+            }
+        }
+        else if (feedback_source == 1)
+        {
+            CartesianPose tcp{};
+            JointValue joints{};
+            const int ret_tcp = robot.get_actual_tcp_position(&tcp);
+            const int ret_joint = robot.get_actual_joint_position(&joints);
+            actual_tcp_valid = (ret_tcp == 0);
+            if (ret_tcp == 0)
+                actual_tcp = tcp;
+            actual_joints_valid = (ret_joint == 0);
+            if (ret_joint == 0)
+                actual_joints = joints;
+            actual_tcp_time = actual_joints_time = steady_seconds();
+        }
         last_feedback_us = (steady_seconds() - t0) * 1e6;
-        actual_tcp_valid = (ret_tcp == 0);
-        if (ret_tcp == 0)
-            actual_tcp = tcp;
-        actual_joints_valid = (ret_joint == 0);
-        if (ret_joint == 0)
-            actual_joints = joints;
-        actual_tcp_time = steady_seconds();
     }
 
     if (status_polling && (++status_tick % static_cast<unsigned long>(status_stride) == 0))
@@ -348,6 +406,9 @@ void refresh_governor_params()
         servo_singularity_slowdown = flag;
     if (g_node->get_parameter("servo_timer_driven", flag))
         servo_timer_driven = flag;
+    if (g_node->get_parameter("servo_min_period_ms", value) &&
+        std::isfinite(value) && value >= 8.0 && value <= 60.0)
+        servo_min_period_s = value / 1000.0;
 }
 
 // Angle to the nearest wrist singularity, in radians. JAKA reports joint values
@@ -403,7 +464,6 @@ void log_robot_configuration()
     if (ret_joints == 0)
     {
         actual_joints = joints;
-        actual_joints_valid = true;
         RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
                     "[%s] joints(rad): %.4f %.4f %.4f %.4f %.4f %.4f -> J5 is %.1f deg "
                     "from the wrist singularity",
@@ -466,7 +526,8 @@ void servo_cartesian(JAKAZuRobot &robot,
     // the same Cartesian command costs a much larger joint motion.
     double step_cap = servo_max_tran_step;
     double rot_cap = rotation_max_step;
-    if (servo_singularity_slowdown && actual_joints_valid)
+    if (servo_singularity_slowdown && actual_joints_valid &&
+        steady_seconds() - actual_joints_time <= 0.3)
     {
         const double scale = singularity_scale();
         step_cap *= scale;
@@ -752,15 +813,12 @@ void servo_cartesian(JAKAZuRobot &robot,
 
 // The controller interpolates exactly one step_num*8 ms window per servo_p call.
 // A second command that arrives before that window closes makes the controller
-// report a "continuous servo command" warning and drop the step, which is
-// exactly how a joint position deviation gets started. A wall timer never fires
-// early, so driving the servo from the 8 ms timer guarantees the window; this
-// guard only protects the legacy message-driven path against collisions.
-constexpr double SERVO_MIN_GAP_S = 0.006;
-
+// report a "continuous servo command" warning and drop the step. The timer
+// driven path cannot overlap by construction; this guard protects the message
+// driven default against the back-to-back bursts the ROS callbacks produce.
 bool servo_send_allowed(double now)
 {
-    if (now - last_servo_send < SERVO_MIN_GAP_S)
+    if (now - last_servo_send < servo_min_period_s)
         return false;
     last_servo_send = now;
     return true;
@@ -1311,7 +1369,9 @@ int main(int argc, char *argv[])
    servo_singularity_min_scale = node->declare_parameter<double>(
        "servo_singularity_min_scale", 0.35);
    servo_timer_driven = node->declare_parameter<bool>(
-       "servo_timer_driven", true);
+       "servo_timer_driven", false);
+   servo_min_period_s = node->declare_parameter<double>(
+       "servo_min_period_ms", 8.5) / 1000.0;
    const std::string blackbox_dir = node->declare_parameter<std::string>(
        "servo_blackbox_dir", std::string("log/teleop"));
    if (!std::isfinite(servo_leash_radius_mm) || servo_leash_radius_mm < 0.0)
@@ -1426,12 +1486,12 @@ int main(int argc, char *argv[])
     RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
                 "[%s] governors: leash=%.0fmm accel=%.0fmm/s2 track_gate=%.1fmm "
                 "deadman=%.1fs singularity=%s(%.0fdeg,min %.2f) timer_driven=%s "
-                "blackbox=%s",
+                "min_period=%.1fms blackbox=%s",
                 arm_name.c_str(), servo_leash_radius_mm, servo_trans_accel_mm_s2,
                 servo_max_track_error_mm, servo_track_deadman_s,
                 servo_singularity_slowdown ? "on" : "off",
                 servo_singularity_threshold_deg, servo_singularity_min_scale,
-                servo_timer_driven ? "on" : "off",
+                servo_timer_driven ? "on" : "off", servo_min_period_s * 1000.0,
                 blackbox.is_open() ? "on" : "off");
 
     rclcpp::spin(node);
