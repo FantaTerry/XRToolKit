@@ -11,6 +11,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 
 #include "rclcpp/rclcpp.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -133,6 +134,7 @@ bool servo_feedback_enabled = true;
 bool servo_singularity_slowdown = true;
 double servo_singularity_threshold_deg = 15.0;
 double servo_singularity_min_scale = 0.35;
+double servo_max_rotation_deg = 180.0;  // posture lock cone; 180 = unlocked
 bool actual_joints_valid = false;
 double actual_joints_time = 0.0;
 // The controller opens one step_num*8 ms interpolation window per servo_p call.
@@ -405,6 +407,9 @@ void refresh_governor_params()
     if (g_node->get_parameter("servo_singularity_min_scale", value) &&
         std::isfinite(value) && value > 0.0 && value <= 1.0)
         servo_singularity_min_scale = value;
+    if (g_node->get_parameter("servo_max_rotation_deg", value) &&
+        std::isfinite(value) && value >= 0.0 && value <= 180.0)
+        servo_max_rotation_deg = value;
     bool flag = false;
     if (g_node->get_parameter("servo_singularity_slowdown", flag))
         servo_singularity_slowdown = flag;
@@ -617,6 +622,22 @@ void servo_cartesian(JAKAZuRobot &robot,
                 jaka_teleop::quat_rotation_angle(desired_rotation);
             desired_rotation = jaka_teleop::quat_scaled_to_angle(
                 desired_rotation, desired_angle * rotation_scale);
+        }
+
+        // Posture lock: keep the commanded tool orientation inside a cone round
+        // the Grip press posture. 180 deg (default) means no limit, 0 freezes the
+        // orientation completely. Freezing it removes the rotation command that
+        // drives J4/J6 through the wrist singularity; the wrist then only moves
+        // as far as the geometry of the translation requires.
+        if (servo_max_rotation_deg < 179.0)
+        {
+            const double limit = servo_max_rotation_deg * PI_D / 180.0;
+            const double angle = jaka_teleop::quat_rotation_angle(desired_rotation);
+            if (angle > limit)
+            {
+                desired_rotation =
+                    jaka_teleop::quat_scaled_to_angle(desired_rotation, limit);
+            }
         }
 
         // Rotation which has not yet reached the robot.
@@ -1376,6 +1397,8 @@ int main(int argc, char *argv[])
        "servo_singularity_threshold_deg", 15.0);
    servo_singularity_min_scale = node->declare_parameter<double>(
        "servo_singularity_min_scale", 0.35);
+   servo_max_rotation_deg = node->declare_parameter<double>(
+       "servo_max_rotation_deg", 180.0);
    servo_timer_driven = node->declare_parameter<bool>(
        "servo_timer_driven", false);
    servo_min_period_s = node->declare_parameter<double>(
@@ -1398,6 +1421,9 @@ int main(int argc, char *argv[])
    if (!std::isfinite(servo_singularity_min_scale) ||
        servo_singularity_min_scale <= 0.0 || servo_singularity_min_scale > 1.0)
        servo_singularity_min_scale = 0.35;
+   if (!std::isfinite(servo_max_rotation_deg) ||
+       servo_max_rotation_deg < 0.0 || servo_max_rotation_deg > 180.0)
+       servo_max_rotation_deg = 180.0;
 
    if (!blackbox_dir.empty())
    {
@@ -1410,6 +1436,9 @@ int main(int argc, char *argv[])
        blackbox.open(path, std::ios::out | std::ios::trunc);
        if (blackbox.is_open())
        {
+           // 6 significant digits rounded every timestamp to 10 ms, which made
+           // the servo cadence unreadable. Keep microseconds in the t column.
+           blackbox << std::setprecision(12);
            blackbox_header();
            blackbox.flush();
            RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
@@ -1493,12 +1522,13 @@ int main(int argc, char *argv[])
                 arm_name.c_str(), servo_max_tran_step, servo_max_tran_step * 125.0);
     RCLCPP_INFO(rclcpp::get_logger("rc_ctrl"),
                 "[%s] governors: leash=%.0fmm accel=%.0fmm/s2 track_gate=%.1fmm "
-                "deadman=%.1fs singularity=%s(%.0fdeg,min %.2f) timer_driven=%s "
-                "min_period=%.1fms blackbox=%s",
+                "deadman=%.1fs singularity=%s(%.0fdeg,min %.2f) rotation_lock=%.0fdeg "
+                "timer_driven=%s min_period=%.1fms blackbox=%s",
                 arm_name.c_str(), servo_leash_radius_mm, servo_trans_accel_mm_s2,
                 servo_max_track_error_mm, servo_track_deadman_s,
                 servo_singularity_slowdown ? "on" : "off",
                 servo_singularity_threshold_deg, servo_singularity_min_scale,
+                servo_max_rotation_deg,
                 servo_timer_driven ? "on" : "off", servo_min_period_s * 1000.0,
                 blackbox.is_open() ? "on" : "off");
 

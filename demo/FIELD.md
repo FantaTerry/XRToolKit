@@ -16,7 +16,30 @@ ros2 param set /rc_ctrl_left  servo_singularity_slowdown true
 ros2 param set /rc_ctrl_right servo_singularity_slowdown true
 ```
 
-然后再测一轮，行为和"原始版本"应该基本一致，只是腕部附近会变慢。
+**设完必须用 `ros2 param get` 确认一次**——上一轮发现右侧是跑到一半才生效的
+（黑匣子里 `held` 从 90% 掉到 0），说明参数是在节点起来之后才被设上的。
+
+---
+
+## 姿态锁定（L1）：固定末端姿态，只跟平移
+
+报警发生在 **J4/J6（腕部）**，而 J4/J6 主要由**旋转指令**驱动。
+把末端姿态锁死，旋转指令就没了，腕部只跟着几何走。
+
+两种做法，都不用改控制律：
+
+```zsh
+# ① 完全锁死：只跟位置，姿态保持握持瞬间的样子（launch 参数）
+./run_teleop.zsh ... use_rpy_ctrl:=false
+
+# ② 允许小幅调整：绕握持姿态 ±N 度以内（热参数，可现场调）
+ros2 param set /rc_ctrl_left  servo_max_rotation_deg 15.0
+ros2 param set /rc_ctrl_right servo_max_rotation_deg 15.0
+ros2 param set /rc_ctrl_left  servo_max_rotation_deg 0.0    # 等于全锁
+ros2 param set /rc_ctrl_left  servo_max_rotation_deg 180.0  # 解除
+```
+
+`servo_max_rotation_deg` 默认 180（不限制），只影响旋转，不影响平移和奇异点降速。
 
 ---
 
