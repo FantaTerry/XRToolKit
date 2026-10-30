@@ -1,54 +1,54 @@
-# FIELD · 现场操作单（临时文件，问题解决后删除）
+# FIELD · 唯一调试路线（临时文件，解决后删除）
 
-分支：`fix/servo-governors`（origin），最新 `ab8ee80` 之后。
-机器人上的工作分支是 `canghao`，**这条分支不用切过去**，下面的命令都能直接用。
+一条路走到黑，中途不要跳步、不要切别的分支。
+每个 **STOP** 点没通过就停下来发我日志，不要继续测。
 
 ---
 
-## Step 0 · 先确认你跑的是哪一版（30 秒，必须先做）
-
-上一轮两次测试的指令节奏都是 **10 ms 为主 + 15% 的 0 ms 叠窗**，这是**旧二进制**的特征（新版的定时器路径会出现 8 ms 的整数倍）。所以先查：
+## Step 1 · 切到一个确定的代码版本（不动你的 `canghao`）
 
 ```zsh
-ros2 param get /rc_ctrl_left servo_min_period_ms      # 新版才有
-ros2 param get /rc_ctrl_left servo_timer_driven       # 上一版才有
-ls -l install/jaka_driver/lib/jaka_driver/rc_ctrl_node  # 看编译时间
+cd ~/Documents/dj_main/XRToolKit
+git stash -u || true
+git fetch origin
+git checkout -B verify-servo origin/fix/servo-governors
+git log --oneline -1
 ```
 
-| 输出 | 结论 |
-|---|---|
-| `Parameter not declared` | **跑的是旧二进制**，编译没生效 |
-| `8.5` / `false` | 新版已加载 |
+**期望**：`git log` 里能看到 `fix(rc_ctrl):` 和 `docs:` 这两类提交，分支名是 `verify-servo`。
+`canghao` 分支原样保留，随时 `git checkout canghao` 回去。
 
-旧的话，**必须清干净再编**（colcon 有时判定"无变化"直接跳过）：
+> 这里就是你之前出错的地方：我的改动一直在 `origin/fix/servo-governors` 上，
+> 而你在 `canghao` 上编译，所以 `./build.zsh` 编的一直是**旧代码**。
+
+---
+
+## Step 2 · 清干净重编，然后确认二进制
 
 ```zsh
 cd ~/Documents/dj_main/XRToolKit/demo
-./clean.zsh && ./build.zsh
-ls -l install/jaka_driver/lib/jaka_driver/rc_ctrl_node   # 时间戳应该是刚才
+./clean.zsh
+./build.zsh
+source ./setup.zsh
 ```
 
-顺便把这三行的输出发我：
+验证（三条都要看）：
 
 ```zsh
-git status -sb
-git log --oneline -3
-ls -l install/jaka_driver/lib/jaka_driver/rc_ctrl_node
+git log --oneline -1
+ros2 pkg prefix jaka_driver
+ls -l "$(ros2 pkg prefix jaka_driver)/lib/jaka_driver/rc_ctrl_node"
 ```
+
+**STOP ①**：二进制的修改时间必须是刚才；`ros2 pkg prefix` 必须指向
+`~/Documents/dj_main/XRToolKit/install/jaka_driver`。
+如果指向别处（比如旧的 overlay），说明启动了别的工作区，告诉我路径。
 
 ---
 
-## Step 1 · 跑一次，抓启动日志
+## Step 3 · 启动（顺序不变：PC-service → Quest → 本机）
 
-新版本启动会多打这两行，**这是这次测试最关键的信息**：
-
-```
-[right] feedback calibration: actual_tcp=..us(ok=0/1) actual_joints=..us(ok=0/1) robot_status=..us(ok=0/1) simple=..us
-[right] feedback source=robot_status every N cycle(s) (.. us/cycle), gate=on, alarm log=on every M cycle(s)
-```
-
-- `feedback source=none` → 三种反馈全不可用，闸门和奇异点降速都关着，**告诉我**
-- `source=robot_status` → 反馈终于通了（上一版是 none）
+照你原来的顺序。唯一区别是**把日志留下来**：
 
 ```zsh
 cd ~/Documents/dj_main/XRToolKit/demo
@@ -57,24 +57,51 @@ cd ~/Documents/dj_main/XRToolKit/demo
   gripper_configure_tio:=false 2>&1 | tee /tmp/teleop_$(date +%H%M).log
 ```
 
-测试动作（5 分钟）：
+---
 
-1. 两臂各握一次、松一次
-2. 把左臂带到会报警的那个姿态附近，慢慢靠近再退出来，重复 3 次
-3. **在会报警的位置停住 3 秒**（保持 Grip 按住不动）
-4. 左手腕左右转、上下翻各 3 次
-5. 做完 Ctrl-C
+## Step 4 · 核对五行启动日志
 
-记录表（看墙上的钟，误差半分钟没关系）：
+另开终端：
 
-| 时间 | 哪只手 | 什么感觉 | 当时在做什么 |
-|---|---|---|---|
-|  |  |  |  |
-|  |  |  |  |
+```zsh
+grep -E 'feedback calibration|feedback source|governors:|black box|joints\(rad\)' /tmp/teleop_*.log
+```
+
+应该看到类似：
+
+```
+[right] feedback calibration: actual_tcp=..us(ok=0/1) actual_joints=..us(ok=0/1) robot_status=..us(ok=0/1) simple=..us
+[right] feedback source=robot_status every N cycle(s) (.. us/cycle), gate=on, alarm log=on every M cycle(s)
+[right] governors: ... timer_driven=off min_period=8.5ms blackbox=on
+[right] black box: log/teleop/right_....csv
+[right] joints(rad): ... -> J5 is .. deg from the wrist singularity
+```
+
+**STOP ②**：
+- 这五行**一条都没有** → 跑的还是旧二进制，回 Step 2。
+- `feedback source=none` → 反馈全不通，闸门和奇异点降速都不会工作，**先别测**，把 calibration 那行发我。
 
 ---
 
-## Step 2 · 出报告
+## Step 5 · 测一次（5 分钟）
+
+1. 两臂各握一次、松一次
+2. 左臂慢慢靠近会报警的姿态，再退出来，重复 3 次
+3. **在会报警的位置按住 Grip 停 3 秒**
+4. 左手腕左右转、上下翻各 3 次
+5. Ctrl-C 结束
+
+记录（看墙上的钟，误差半分钟没事）：
+
+| 时间 | 哪只手 | 什么感觉 | 在做什么 |
+|---|---|---|---|
+|  |  |  |  |
+
+**报警时顺手拍一下示教器弹窗的中文原文**（这是现在最缺的一块）。
+
+---
+
+## Step 6 · 出报告
 
 ```zsh
 cd ~/Documents/dj_main/XRToolKit
@@ -83,11 +110,20 @@ python3 demo/tools/teleop_report.py demo/log/teleop
 
 ---
 
-## Step 3 · 发我这些
+## 发我这些
 
-1. Step 0 的三行输出（确认版本）
-2. 启动的 `feedback calibration` 和 `feedback source` 两行
-3. 报告输出（10 行）
-4. 记录表
+1. Step 2 的三条验证输出
+2. Step 4 的五行日志（缺哪行也要说）
+3. Step 6 的报告
+4. 记录表 + 示教器报警原文
 5. `grep -E 'ALARM|CONTROLLER' /tmp/teleop_*.log`
 
+---
+
+## 出错时的回退
+
+```zsh
+cd ~/Documents/dj_main/XRToolKit
+git checkout canghao        # 回到你原来的分支
+cd demo && ./clean.zsh && ./build.zsh
+```
